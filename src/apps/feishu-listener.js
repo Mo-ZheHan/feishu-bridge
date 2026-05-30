@@ -360,27 +360,28 @@ class FeishuListener {
             });
             return '空会话';
         }
+        this.bindSessionInput(card, session, 'ccback'); // 非空会话也补输入框，可直接追问
         await this.sendCardJson(notification.chat_id, card);
         return '已回顾';
+    }
+
+    /** 给卡片补「输入框 + 中断 + 终端 id」并登记会话终端，使其能直接接回发指令；启动卡与 ccback 回顾卡共用。 */
+    bindSessionInput(card, name, type = 'launched') {
+        const stateKey = `feishu_${name}_${Date.now()}`;
+        this.state.addNotification(stateKey, {
+            session_id: name, notification_type: type, pts_device: `tmux:${name}`, created_at: Date.now(),
+            responses: { esc: { keys: '\x1b', label: 'Esc' }, interrupt: { keys: '\x1b', label: '⛔ 中断' } },
+        });
+        card.body.elements.push(inputEl(stateKey, '给会话发指令...'), escFooterRow(stateKey, `tmux:${name}`));
     }
 
     /** 发带输入框的卡、绑定会话终端——新启动会话靠它发第一条指令，ccback 空会话靠它接回。
      *  opts: { template, title, intro } 覆盖默认（启动场景） */
     async sendLaunchedCard(chatId, label, name, opts = {}) {
         const { template = 'green', title = `已启动 · ${label}`, intro = '在下方直接发指令给它' } = opts;
-        const stateKey = `feishu_${name}_${Date.now()}`;
-        this.state.addNotification(stateKey, {
-            session_id: name, notification_type: 'launched', pts_device: `tmux:${name}`, created_at: Date.now(),
-            responses: { esc: { keys: '\x1b', label: 'Esc' }, interrupt: { keys: '\x1b', label: '⛔ 中断' } },
-        });
-        await this.sendCardJson(chatId, card2({
-            template, title,
-            elements: [
-                { tag: 'markdown', content: intro },
-                inputEl(stateKey, '给会话发指令...'),
-                escFooterRow(stateKey, `tmux:${name}`), // 中断 + 右侧终端 id
-            ],
-        }));
+        const card = card2({ template, title, elements: [{ tag: 'markdown', content: intro }] });
+        this.bindSessionInput(card, name);
+        await this.sendCardJson(chatId, card);
     }
 
     /** 发消息到群：text → 纯文本，card → 交互卡片 */
