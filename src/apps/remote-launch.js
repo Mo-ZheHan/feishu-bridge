@@ -12,6 +12,32 @@ const { spawnSync } = require('child_process');
 
 const { RL_HOST, RL_PROJ, RL_BASE, RL_DEST, RL_NAME, RL_CHAT_ID, RL_BIN } = process.env;
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/** tmux 当前可见内容（失败返 ''） */
+const capturePane = session => {
+    const r = spawnSync('tmux', ['capture-pane', '-p', '-t', session], { encoding: 'utf8', timeout: 5000 });
+    return r.status === 0 ? (r.stdout || '') : '';
+};
+
+/**
+ * 发卡前等 Claude TUI 就绪：空窗期（mutagen 同步 / exec claude）里注入的首条指令会被吞（间歇丢消息根因）。
+ * 轮询 SessionStart 落盘的 /tmp/claude-tmux-<session>.json；新目录首启的信任弹窗替用户回车确认。超时也放行。
+ */
+async function waitForSessionReady(session, { bootMs = 120000, settleMs = 1500 } = {}) {
+    const file = `/tmp/claude-tmux-${session}.json`;
+    const deadline = Date.now() + bootMs;
+    let trusted = false;
+    while (Date.now() < deadline && !fs.existsSync(file)) {
+        if (!trusted && /trust this folder/i.test(capturePane(session))) {
+            spawnSync('tmux', ['send-keys', '-t', session, 'Enter']);
+            trusted = true;
+        }
+        await sleep(300);
+    }
+    await sleep(settleMs);
+}
+
 /** 从 ~/.mutagen.yml 派生 rsync exclude，与 zshrc 单一来源一致 */
 function mutagenExcludes() {
     const yml = `${process.env.HOME}/.mutagen.yml`;
@@ -79,6 +105,7 @@ async function main() {
         await notify(`❌ tmux 启动失败：${(tmux.stderr || '').trim()}`, 'red');
         return;
     }
+    await waitForSessionReady(RL_NAME);
     await announceReady();
 }
 
