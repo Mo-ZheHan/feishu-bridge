@@ -1,0 +1,7 @@
+{
+  "session_id": "abc123",
+  "cwd": "/tmp/demo",
+  "hook_event_name": "Stop",
+  "stop_reason": "completed",
+  "last_assistant_message": "Task finished successfully"
+}

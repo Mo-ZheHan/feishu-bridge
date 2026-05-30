@@ -1,0 +1,17 @@
+{
+  "session_id": "abc123",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "Which option should I use?",
+        "multiSelect": false,
+        "options": [
+          { "label": "Option A", "value": "option-a" },
+          { "label": "Option B", "value": "option-b" }
+        ]
+      }
+    ]
+  }
+}
