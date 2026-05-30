@@ -17,6 +17,12 @@ const CODE_DIR = process.env.CLAUDE_LAUNCH_DIR || `${HOME}/Code`;
 const REMOTE_HOSTS = (process.env.CLAUDE_REMOTE_HOSTS
     || 'devcloud cscg102 cscg103 cscg104 cscg106 fitten fitten2 hpc').split(/\s+/).filter(Boolean);
 const REMOTE_BASE = process.env.CLAUDE_REMOTE_BASE || '~/Code';
+// 个别主机项目根不在 ~/Code（hpc 放 home 根）：CLAUDE_REMOTE_BASE_OVERRIDE="hpc=~ 别的=/path" 逐主机覆盖（同 zshrc）
+const BASE_OVERRIDE = Object.fromEntries(
+    (process.env.CLAUDE_REMOTE_BASE_OVERRIDE || '').split(/[;,\s]+/).filter(Boolean)
+        .map(p => p.split('=')).filter(([h, b]) => h && b)
+);
+const remoteBase = host => BASE_OVERRIDE[host] || REMOTE_BASE;
 const WORK_DIR = process.env.CLAUDE_WORK_DIR || `${HOME}/ClaudeWork`;
 
 // 项目名安全白名单：进 tmux/ssh/rsync 命令前过滤，杜绝注入与空格破句
@@ -40,7 +46,7 @@ function listLocalProjects() {
 
 /** ssh 列远程 host 的 base 下一级目录。返回 { projects } 或 { error } */
 function listRemoteProjects(host) {
-    const r = spawnSync('ssh', [host, `cd ${REMOTE_BASE} 2>/dev/null && ls -1d */ 2>/dev/null`],
+    const r = spawnSync('ssh', [host, `cd ${remoteBase(host)} && ls -1d */ 2>/dev/null`],
         { encoding: 'utf8', timeout: 15000 });
     if (r.status !== 0) return { error: (r.stderr || r.error?.message || 'ssh 失败').trim() };
     const projects = (r.stdout || '').split('\n')
@@ -66,7 +72,7 @@ function launchRemote(host, proj, chatId) {
     const dest = path.join(WORK_DIR, host, proj);
     const name = sessionName(`${host}-${proj}`);
     const child = spawn(process.execPath, [path.join(__dirname, 'remote-launch.js')], {
-        env: { ...process.env, RL_HOST: host, RL_PROJ: proj, RL_BASE: REMOTE_BASE, RL_DEST: dest, RL_NAME: name, RL_CHAT_ID: chatId || '', RL_BIN: CLAUDE_BIN },
+        env: { ...process.env, RL_HOST: host, RL_PROJ: proj, RL_BASE: remoteBase(host), RL_DEST: dest, RL_NAME: name, RL_CHAT_ID: chatId || '', RL_BIN: CLAUDE_BIN },
         detached: true, stdio: 'ignore',
     });
     child.unref();
