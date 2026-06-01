@@ -1,0 +1,83 @@
+{
+  "_comment": "合并进 ~/.claude/settings.json，把 /Users/csrobo/Code/agent_notifier 换成你的仓库路径。各 hook 与 statusLine 的职责见 setup/README.md。",
+  "permissions": {
+    "defaultMode": "auto"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/csrobo/Code/agent_notifier/hook-handler.js"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/csrobo/Code/agent_notifier/hook-handler.js"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|idle_prompt|elicitation_dialog",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/csrobo/Code/agent_notifier/hook-handler.js"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/csrobo/Code/agent_notifier/hook-handler.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|NotebookEdit|WebSearch|WebFetch|Agent|Task|Skill|SlashCommand|TodoWrite|ExitPlanMode|KillShell|BashOutput",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/csrobo/Code/agent_notifier/live-handler.js"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/csrobo/Code/agent_notifier/ask-handler.js"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node /Users/csrobo/Code/agent_notifier/src/apps/cost-capture.js | ccusage statusline | node /Users/csrobo/Code/agent_notifier/src/apps/statusline-fix.js",
+    "refreshInterval": 5
+  },
+  "effortLevel": "xhigh",
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "light",
+  "preferredNotifChannel": "terminal_bell",
+  "autoCompactEnabled": false,
+  "inputNeededNotifEnabled": true,
+  "agentPushNotifEnabled": true
+}

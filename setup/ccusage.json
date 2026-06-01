@@ -1,0 +1,37 @@
+{
+  "$schema": "/Users/csrobo/.nvm/versions/node/v20.20.2/lib/node_modules/ccusage/config-schema.json",
+  "defaults": {
+    "timezone": "Asia/Shanghai",
+    "mode": "auto",
+    "order": "asc",
+    "breakdown": false,
+    "json": false,
+    "compact": false
+  },
+  "claude": {
+    "defaults": {
+      "timezone": "Asia/Shanghai",
+      "mode": "auto",
+      "order": "asc",
+      "breakdown": false,
+      "offline": false,
+      "json": false,
+      "compact": false
+    },
+    "commands": {
+      "blocks": {
+        "active": true,
+        "sessionLength": 5
+      },
+      "weekly": {
+        "startOfWeek": "monday"
+      },
+      "statusline": {
+        "visualBurnRate": "emoji",
+        "costSource": "auto",
+        "refreshInterval": 3,
+        "offline": true
+      }
+    }
+  }
+}

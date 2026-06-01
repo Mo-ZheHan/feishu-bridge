@@ -1,0 +1,16 @@
+# → ~/.mutagen.yml
+# 同步忽略的单一来源：既是 mutagen（claude-remote-shell 内部用）的默认忽略，
+# 也被 zshrc / remote-launch.js 的 rsync 用 yq 读 paths 派生成 --exclude。
+sync:
+  defaults:
+    ignore:
+      vcs: false
+      paths:
+        - ".venv/"
+        - "__pycache__/"
+        - "wandb/"
+        - "*.ckpt"
+        - "*.safetensors"
+        - "*.bin"
+        - "*.pt"
+        - "*.pth"

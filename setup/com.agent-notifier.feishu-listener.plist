@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  飞书监听守护进程的 launchd 配置 → ~/Library/LaunchAgents/。加载/重启见 setup/README.md §4。
+  按本机改三处：① node 绝对路径（command -v node 查）② 仓库路径（脚本 / WorkingDirectory / 日志）③ PATH 首段 = node bin 目录。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agent-notifier.feishu-listener</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/csrobo/.nvm/versions/node/v20.20.2/bin/node</string>
+        <string>/Users/csrobo/Code/agent_notifier/feishu-listener.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/csrobo/Code/agent_notifier</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/csrobo/.nvm/versions/node/v20.20.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/csrobo/Code/agent_notifier/feishu-listener.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/csrobo/Code/agent_notifier/feishu-listener.log</string>
+</dict>
+</plist>

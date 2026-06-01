@@ -1,0 +1,54 @@
+# 追加到 ~/.ssh/config —— claude <host> 的远程主机。脱敏模板：HostName/User/Port 是占位符，
+# 填回真实值（真实配置只在本机 ~/.ssh/config，不进版本库）。Host 别名须和 zshrc 的
+# CLAUDE_REMOTE_HOSTS / launcher.js 的 REMOTE_HOSTS 一致；全部走 ~/.ssh/id_ed25519 免密。
+
+Host devcloud
+    HostName <devcloud-host>
+    User <user>
+    Port <port>
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 30m
+
+Host cscg102
+  HostName <cscg-host>
+  User <user>
+  Port <port-02>
+  IdentityFile ~/.ssh/id_ed25519
+
+Host cscg103
+  HostName <cscg-host>
+  User <user>
+  Port <port-03>
+  IdentityFile ~/.ssh/id_ed25519
+
+Host cscg104
+  HostName <cscg-host>
+  User <user>
+  Port <port-04>
+  IdentityFile ~/.ssh/id_ed25519
+
+Host cscg106
+  HostName <cscg-host>
+  User <user>
+  Port <port-06>
+  IdentityFile ~/.ssh/id_ed25519
+
+Host fitten
+  HostName <fitten-host>
+  User <user>
+  Port <port-a>
+  IdentityFile ~/.ssh/id_ed25519
+
+Host fitten2
+  HostName <fitten-host>
+  User <user>
+  Port <port-b>
+  IdentityFile ~/.ssh/id_ed25519
+
+# hpc 项目放在 home 根而非 ~/Code → CLAUDE_REMOTE_BASE_OVERRIDE=hpc=~
+Host hpc
+  HostName <hpc-host>
+  User <hpc-user>
+  Port <port>
+  IdentityFile ~/.ssh/id_ed25519
