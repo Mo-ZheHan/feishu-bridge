@@ -165,27 +165,27 @@ function handleStop(data, getStats) {
     return buildCard('Claude 完成', shown, 'green', getStats());
 }
 
-/** API 错误真实文本：payload 不带时反扫 transcript 取最近一条 isApiErrorMessage 助手消息 */
+// 官方错误码 → 中文标题；未命中则统一「异常退出」
+const ERROR_TITLES = {
+    rate_limit: 'API 频率限制',
+    authentication_failed: '认证失败',
+    billing_error: '计费错误',
+    server_error: '服务器错误',
+    max_output_tokens: '输出超长',
+    invalid_request: '请求无效',
+};
+
+/** payload 不带 error_details 时，反扫 transcript 取最近一条 API 错误助手消息的原文 */
 function latestApiError(transcriptPath) {
     return findTail(transcriptPath, (d) =>
         d.type === 'assistant' && d.isApiErrorMessage ? getAssistantText(d) || undefined : undefined
     );
 }
 
+/** StopFailure：标题取官方错误码映射，正文为错误原文 */
 function handleStopFailure(data, getStats) {
-    const error = data.error || 'unknown';
+    const title = ERROR_TITLES[data.error] || '异常退出';
     const details = data.error_details || latestApiError(data.transcript_path) || '发生未知错误';
-
-    const errorMap = {
-        'rate_limit': 'API 频率限制',
-        'authentication_failed': '认证失败',
-        'billing_error': '计费错误',
-        'server_error': '服务器错误',
-        'max_output_tokens': '输出超长',
-        'invalid_request': '请求无效'
-    };
-    const title = errorMap[error] || '异常退出';
-
     return buildCard(title, details, 'red', getStats());
 }
 
@@ -431,7 +431,12 @@ async function main() {
     }
 }
 
-main().catch(err => {
-    console.error('Hook handler error:', err.message);
-    process.exit(0); // 不要阻塞 Claude
-});
+// require.main 守卫：直接运行时自动跑；被 require 复用导出时由调用方显式 .main()
+if (require.main === module) {
+    main().catch(err => {
+        console.error('Hook handler error:', err.message);
+        process.exit(0); // 不要阻塞 Claude
+    });
+}
+
+module.exports = { main, handleStopFailure, latestApiError };
