@@ -79,6 +79,20 @@ function launchRemote(host, proj, chatId) {
     return { name, dest };
 }
 
+/** kdbg 启动：项目在本地 ~/Code、Bash 跑在 debug Pod。Pod 就绪耗时不定，异步交给 kdbg-launch.js，立即返回 { name, dir } 或 { error } */
+function launchKdbg(projName, chatId) {
+    if (!SAFE_NAME.test(projName)) return { error: `非法项目名: ${projName}` };
+    const dir = path.join(CODE_DIR, projName);
+    if (!fs.existsSync(dir)) return { error: `目录不存在: ${dir}` };
+    const name = sessionName(`kdbg-${projName}`);
+    const child = spawn(process.execPath, [path.join(__dirname, 'kdbg-launch.js')], {
+        env: { ...process.env, KL_PROJ: projName, KL_DIR: dir, KL_NAME: name, KL_CHAT_ID: chatId || '', KL_BIN: CLAUDE_BIN },
+        detached: true, stdio: 'ignore',
+    });
+    child.unref();
+    return { name, dir };
+}
+
 /** 正在运行的 claude tmux 会话名（与 zshrc ccback 同源） */
 function listClaudeSessions() {
     const r = spawnSync('tmux', ['list-sessions', '-F', '#{session_name}'], { encoding: 'utf8' });
@@ -93,4 +107,4 @@ function sessionTranscript(session) {
     catch { return null; }
 }
 
-module.exports = { REMOTE_HOSTS, CODE_DIR, REMOTE_BASE, listLocalProjects, listRemoteProjects, launchLocal, launchRemote, listClaudeSessions, sessionTranscript };
+module.exports = { REMOTE_HOSTS, CODE_DIR, REMOTE_BASE, listLocalProjects, listRemoteProjects, launchLocal, launchRemote, launchKdbg, listClaudeSessions, sessionTranscript };

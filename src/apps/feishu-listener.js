@@ -267,7 +267,7 @@ class FeishuListener {
         return m ? +m[1] : -1;
     }
 
-    /** 文本消息入口：`claude` → 本地菜单；`claude <host>` → 远程菜单；`ccback` → 会话回顾 */
+    /** 文本消息入口：`claude` → 本地菜单；`claude kdbg` → 本地项目+debug Pod；`claude <host>` → 远程菜单；`ccback` → 会话回顾 */
     async handleMessage(data) {
         const msg = data?.message;
         if (!msg || msg.message_type !== 'text') return;
@@ -281,16 +281,17 @@ class FeishuListener {
         const host = parts[1];
         console.log(`[feishu-listener] 启动命令: claude ${host || '(本地)'}`);
         if (!host) return this.sendLaunchMenu(chatId, 'local');
+        if (host === 'kdbg') return this.sendLaunchMenu(chatId, 'kdbg'); // 本地项目，Bash 跑在 KOALA debug Pod
         if (launcher.REMOTE_HOSTS.includes(host)) return this.sendLaunchMenu(chatId, 'remote', host);
-        await this.sendText(chatId, `未知主机「${host}」。可用：${launcher.REMOTE_HOSTS.join(' ')}\n或直接发 claude 启动本地`);
+        await this.sendText(chatId, `未知主机「${host}」。可用：kdbg ${launcher.REMOTE_HOSTS.join(' ')}\n或直接发 claude 启动本地`);
     }
 
     /** 发项目选择菜单卡（竖排按钮，opt_N → items[N]） */
     async sendLaunchMenu(chatId, mode, host) {
         let projects, title, question;
-        if (mode === 'local') {
+        if (mode === 'local' || mode === 'kdbg') {
             projects = launcher.listLocalProjects();
-            title = '启动 claude · 本地 ~/Code';
+            title = mode === 'kdbg' ? '启动 claude kdbg · ~/Code → debug Pod' : '启动 claude · 本地 ~/Code';
             question = '选择项目目录：';
         } else {
             const r = launcher.listRemoteProjects(host);
@@ -299,7 +300,7 @@ class FeishuListener {
             title = `启动 claude · ${host}`;
             question = `选择 ${host} 上的项目：`;
         }
-        if (!projects.length) return this.sendText(chatId, mode === 'local' ? '~/Code 下没有项目目录' : `${host} 上没有项目`);
+        if (!projects.length) return this.sendText(chatId, mode === 'remote' ? `${host} 上没有项目` : '~/Code 下没有项目目录');
 
         const stateKey = `feishu_launch_${Date.now()}`;
         this.state.addNotification(stateKey, { created_at: Date.now(), _launch: true, mode, host: host || null, chat_id: chatId, items: projects });
@@ -312,7 +313,7 @@ class FeishuListener {
         await this.sendCardJson(chatId, card2({ template: 'blue', title, elements: els }));
     }
 
-    /** 启动菜单回调：opt_N → 本地立即启动 / 远程异步拉取 */
+    /** 启动菜单回调：opt_N → 本地立即启动 / kdbg、远程异步准备 */
     async handleLaunch(notification, action_type, stateKey) {
         const i = this.menuIndex(action_type);
         if (i < 0) return;
@@ -325,6 +326,12 @@ class FeishuListener {
             if (r.error) { await this.sendText(notification.chat_id, `❌ 启动失败：${r.error}`); return '启动失败'; }
             await this.sendLaunchedCard(notification.chat_id, proj, r.name);
             return '已启动';
+        }
+        if (notification.mode === 'kdbg') {
+            const r = launcher.launchKdbg(proj, notification.chat_id);
+            if (r.error) { await this.sendText(notification.chat_id, `❌ 启动失败：${r.error}`); return '启动失败'; }
+            await this.sendText(notification.chat_id, `🛰 正在准备 debug Pod 并启动 ${proj}…\n（无 Pod 会自动新建，约 1~3 分钟）就绪后自动发卡`);
+            return '准备中';
         }
         launcher.launchRemote(notification.host, proj, notification.chat_id);
         await this.sendText(notification.chat_id, `⏬ 正在从 ${notification.host} 拉取 ${proj}…\n完成后自动启动并通知`);
