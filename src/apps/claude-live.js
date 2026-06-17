@@ -297,18 +297,23 @@ function toolPanel(e, capture) {
     };
 }
 
-/** 单个「文字段 + 其工具」渲染成一张执行摘要卡 */
-function buildSegmentCard(seg, projectName, capture, ptsDevice) {
+/** 整轮所有文字段 + 其工具合并成「一张」执行摘要卡：按 transcript 真实先后混排
+ *  （文字→工具→文字→工具…）、段间 hr 分隔，而非文字全堆顶、命令全堆底。 */
+function buildSummaryCard(segments, projectName, capture, ptsDevice) {
     const elements = [];
-    if (capture.output && seg.text) {
-        elements.push({ tag: 'collapsible_panel', expanded: true, header: { title: { tag: 'plain_text', content: `❯ ${termLabel(ptsDevice) || 'Claude'}` } }, elements: [{ tag: 'markdown', content: seg.text }] });
-        elements.push({ tag: 'hr' });
-    }
-    for (const e of seg.tools) elements.push(toolPanel(e, capture));
+    let totalSteps = 0;
+    segments.forEach((seg, idx) => {
+        if (idx > 0) elements.push({ tag: 'hr' }); // 段间分隔
+        if (capture.output && seg.text) {
+            elements.push({ tag: 'collapsible_panel', expanded: true, header: { title: { tag: 'plain_text', content: `❯ ${termLabel(ptsDevice) || 'Claude'}` } }, elements: [{ tag: 'markdown', content: seg.text }] });
+        }
+        for (const e of seg.tools) elements.push(toolPanel(e, capture));
+        totalSteps += seg.tools.length;
+    });
     return fitCardBudget(card2({
         template: 'blue',
         title: '执行摘要',
-        tags: [{ text: `${seg.tools.length} 步`, color: 'blue' }],
+        tags: [{ text: `${totalSteps} 步`, color: 'blue' }],
         elements,
     }));
 }
@@ -415,7 +420,7 @@ async function flushBuffer(bufferPath) {
     const stateKey = 'live_msg_' + sessionKey;
     const existing = sessionState.data[stateKey];
 
-    // flush 时 transcript 已落盘，按文字边界拆成多张卡（每段文字 + 其后工具一张）
+    // flush 时 transcript 已落盘，重建本轮「文字段 → 其后工具」结构
     const capture = parseCaptureConfig() || {};
     const transcriptPath = entries[entries.length - 1]?.transcriptPath;
     const projectName = entries[entries.length - 1]?.projectName || '';
@@ -424,30 +429,34 @@ async function flushBuffer(bufferPath) {
     const withTools = segments.filter(s => s.tools.length > 0); // 纯文字尾段交给绿色 Stop 卡，不在此重复
     if (!withTools.length) return;
 
-    // 跨 turn（turnTs 变）重置卡片索引；同 turn 内按段索引：内容变才 patch、新段 create（触发通知）
-    const cards = existing && existing.turnTs === turnTs ? (existing.cards || []) : [];
-    for (let i = 0; i < withTools.length; i++) {
-        const card = buildSegmentCard(withTools[i], projectName, capture, ptsDevice);
-        const sig = hashStr(JSON.stringify(card.body.elements));
-        const slot = cards[i];
-        if (slot?.message_id) {
-            if (slot.sig === sig) continue; // 内容没变 → 免一次 patch
-            try {
-                await client.im.message.patch({ path: { message_id: slot.message_id }, data: { content: JSON.stringify(card) } });
-                slot.sig = sig;
-            } catch (err) { console.error('[live/flush] patch 失败:', err.message); }
-        } else {
-            try {
-                const r = await client.im.message.create({
-                    params: { receive_id_type: 'chat_id' },
-                    data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) },
-                });
-                if (r?.data?.message_id) cards[i] = { message_id: r.data.message_id, sig };
-            } catch (err) { console.error('[live/flush] 发送失败:', err.message); }
+    // 整轮合并成一张卡：同 turn 复用 message_id、仅内容变时 patch（新工具静默并入同卡）；跨 turn 才新发，响一次通知
+    const card = buildSummaryCard(withTools, projectName, capture, ptsDevice);
+    const sig = hashStr(JSON.stringify(card.body.elements));
+    const content = JSON.stringify(card);
+    const sameTurn = !!(existing && existing.turnTs === turnTs && existing.message_id);
+
+    let messageId = sameTurn ? existing.message_id : null;
+    let storedSig = sameTurn ? existing.sig : null;
+
+    if (messageId) {
+        if (storedSig !== sig) {
+            try { await client.im.message.patch({ path: { message_id: messageId }, data: { content } }); storedSig = sig; }
+            catch (err) { console.error('[live/flush] patch 失败:', err.message); }
         }
+    } else {
+        try {
+            const r = await client.im.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: { receive_id: chatId, msg_type: 'interactive', content },
+            });
+            messageId = r?.data?.message_id || null; storedSig = sig;
+        } catch (err) { console.error('[live/flush] 发送失败:', err.message); }
     }
-    sessionState.data[stateKey] = { turnTs, cards, created_at: Date.now() };
-    sessionState.save();
+
+    if (messageId) {
+        sessionState.data[stateKey] = { turnTs, message_id: messageId, sig: storedSig, created_at: Date.now() };
+        sessionState.save();
+    }
 }
 
-module.exports = { run, reconstructSegments, formatToolInput, parseCaptureConfig, clipLines, buildSegmentCard, KEY_TOOLS };
+module.exports = { run, reconstructSegments, formatToolInput, parseCaptureConfig, clipLines, buildSummaryCard, KEY_TOOLS };

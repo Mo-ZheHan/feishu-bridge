@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { reconstructSegments, formatToolInput, clipLines, buildSegmentCard, KEY_TOOLS } = require('../../src/apps/claude-live');
+const { reconstructSegments, formatToolInput, clipLines, buildSummaryCard, KEY_TOOLS } = require('../../src/apps/claude-live');
 
 /** 把若干 transcript 行写到临时 jsonl，返回路径 */
 function writeTranscript(lines) {
@@ -37,12 +37,12 @@ test('formatToolInput：子代理/技能/待办等取可读单行，不裸 JSON'
   assert.equal(formatToolInput('KillShell', { shell_id: 'bash_3' }), '终止后台 bash_3');
 });
 
-test('buildSegmentCard：每个工具一张折叠面板（非表格）；Bash 展示命令+输出，Edit 展示 diff', () => {
+test('buildSummaryCard：每个工具一张折叠面板（非表格）；Bash 展示命令+输出，Edit 展示 diff', () => {
   const seg = { text: '', tools: [
     { tool: 'Bash', icon: '⌘', input: 'git add -A\ngit push', raw: { command: 'git add -A\ngit push' }, result: 'pushed\n2 files' },
     { tool: 'Edit', icon: '📝', input: '编辑 a.js', raw: { file_path: 'a.js', old_string: 'foo', new_string: 'bar' }, result: 'The file a.js has been updated successfully.' },
   ] };
-  const card = buildSegmentCard(seg, 'proj', { tools: true, output: true, results: true }, 'tmux:x');
+  const card = buildSummaryCard([seg], 'proj', { tools: true, output: true, results: true }, 'tmux:x');
 
   const panels = card.body.elements.filter(el => el.tag === 'collapsible_panel');
   assert.equal(panels.length, 2);
@@ -60,23 +60,23 @@ test('buildSegmentCard：每个工具一张折叠面板（非表格）；Bash �
   assert.ok(!editBody.includes('updated successfully'), '写改类的套话结果应隐藏');
 });
 
-test('buildSegmentCard：常规多行内容全文展示，不再砍成 15 行', () => {
+test('buildSummaryCard：常规多行内容全文展示，不再砍成 15 行', () => {
   const cmd = Array.from({ length: 40 }, (_, i) => `echo ${i}`).join('\n'); // 40 行远超旧的 15 行硬截
   const seg = { text: '', tools: [{ tool: 'Bash', icon: '⌘', input: 'big', raw: { command: cmd }, result: '' }] };
-  const card = buildSegmentCard(seg, 'p', { tools: true, output: true, results: true }, 'tmux:x');
+  const card = buildSummaryCard([seg], 'p', { tools: true, output: true, results: true }, 'tmux:x');
   const body = JSON.stringify(card);
   assert.ok(body.includes('echo 39'), '第 40 行也应在卡内（未被 15 行截断）');
   assert.ok(!body.includes('已截断'), '常规体量不应触发截断提示');
 });
 
-test('buildSegmentCard：超 56 字的单行命令/URL，标题截断但正文兜底全文（不丢内容）', () => {
+test('buildSummaryCard：超 56 字的单行命令/URL，标题截断但正文兜底全文（不丢内容）', () => {
   const longCmd = 'curl -sSL https://example.com/very/long/path?a=1\\&b=2\\&c=3\\&d=4\\&e=5 | jq .data'; // >56 单行
   const longUrl = 'https://example.com/some/really/long/article/path/that/exceeds/fifty-six-characters';
   const seg = { text: '', tools: [
     { tool: 'Bash', icon: '⌘', input: longCmd, raw: { command: longCmd }, result: '' },
     { tool: 'WebFetch', icon: '🌐', input: longUrl, raw: { url: longUrl }, result: '' },
   ] };
-  const card = buildSegmentCard(seg, 'p', { tools: true, output: true, results: true }, 'tmux:x');
+  const card = buildSummaryCard([seg], 'p', { tools: true, output: true, results: true }, 'tmux:x');
   const panels = card.body.elements.filter(el => el.tag === 'collapsible_panel');
   // 标题是预览（被截断带省略号），正文兜底完整内容
   assert.ok(panels[0].header.title.content.includes('…'), 'Bash 标题应为截断预览');
@@ -84,13 +84,30 @@ test('buildSegmentCard：超 56 字的单行命令/URL，标题截断但正文�
   assert.ok(panels[1].elements.some(e => e.content.includes('fifty-six-characters')), 'WebFetch 完整 URL 应在正文兜底');
 });
 
-test('buildSegmentCard：病态超大内容回退裁剪到飞书硬上限内，并诚实标注', () => {
+test('buildSummaryCard：病态超大内容回退裁剪到飞书硬上限内，并诚实标注', () => {
   const huge = Array.from({ length: 8000 }, (_, i) => `${i} │ line ${i}`).join('\n'); // ~数百 KB，超 150KB 硬限
   const seg = { text: '', tools: [{ tool: 'Bash', icon: '⌘', input: 'huge', raw: { command: huge }, result: '' }] };
-  const card = buildSegmentCard(seg, 'p', { tools: true, output: true, results: true }, 'tmux:x');
+  const card = buildSummaryCard([seg], 'p', { tools: true, output: true, results: true }, 'tmux:x');
   const bytes = Buffer.byteLength(JSON.stringify(card), 'utf8');
   assert.ok(bytes <= 120 * 1024, `整卡应裁到硬上限下，实测 ${bytes} 字节`);
   assert.ok(JSON.stringify(card).includes('已截断，超出飞书单卡'), '裁剪时应诚实标注');
+});
+
+test('buildSummaryCard：多段合并成一张卡，按真实时序混排（文字→工具→文字→工具），段间 hr 分隔', () => {
+  const segs = [
+    { text: '先解释', tools: [{ tool: 'Bash', icon: '⌘', input: 'echo a', raw: { command: 'echo a' }, result: 'a' }] },
+    { text: '再解释', tools: [{ tool: 'Bash', icon: '⌘', input: 'echo b', raw: { command: 'echo b' }, result: 'b' }] },
+  ];
+  const card = buildSummaryCard(segs, 'p', { tools: true, output: true, results: true }, 'tmux:x');
+  const els = card.body.elements;
+
+  assert.equal(els.filter(e => e.tag === 'hr').length, 1, '2 段同卡 → 1 条段间 hr');
+
+  const flat = JSON.stringify(els);
+  const i1 = flat.indexOf('先解释'), iA = flat.indexOf('echo a'), i2 = flat.indexOf('再解释'), iB = flat.indexOf('echo b');
+  assert.ok(i1 < iA && iA < i2 && i2 < iB, '应按真实时序混排，文字与命令交错而非分堆');
+
+  assert.ok(JSON.stringify(card.header).includes('2 步'), 'header 步数应为两段之和');
 });
 
 test('clipLines：保留前 n 行（多行不再只剩第一行），超出补省略号、去尾部空白', () => {
