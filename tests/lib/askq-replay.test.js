@@ -14,6 +14,7 @@ const DOWN = '\x1b[B';
 const UP = '\x1b[A';
 const RIGHT = '\x1b[C';
 const ENTER = '\r';
+const ESC = '\x1b';
 const keysOf = (plan) => plan.map(s => (
   s.keys != null ? { keys: s.keys }
     : s.multiCustom != null ? { multiCustom: s.multiCustom }
@@ -41,6 +42,36 @@ test('单题单选自定义：Down×len 到 Type something + 打字回车，无�
 test('单题单选自定义优先于下拉选项', () => {
   const plan = buildReplayPlan([{ multiSelect: false, optionCount: 3 }], { q0: '1', q0_other: '自定义' });
   assert.deepEqual(keysOf(plan), [{ keys: DOWN.repeat(3) }, { text: '自定义', submit: true }]);
+});
+
+test('预览题：仅选项 → Down×idx + Enter（无自定义行，直接选中提交）', () => {
+  const plan = buildReplayPlan([{ multiSelect: false, hasPreview: true, optionCount: 3 }], { q0: '1' });
+  assert.deepEqual(keysOf(plan), [{ keys: DOWN.repeat(1) }, { keys: ENTER }]);
+});
+
+test('预览题：选项 + 备注 → Down×idx + n + 打字(不回车) + Esc + Enter', () => {
+  const plan = buildReplayPlan([{ multiSelect: false, hasPreview: true, optionCount: 3 }], { q0: '2', q0_note: '居中很好' });
+  assert.deepEqual(keysOf(plan), [
+    { keys: DOWN.repeat(2) },
+    { keys: 'n' },
+    { text: '居中很好', submit: false },
+    { keys: ESC },
+    { keys: ENTER },
+  ]);
+});
+
+test('预览题：首项(idx0) + 备注 → 不 Down，n + 打字 + Esc + Enter', () => {
+  const plan = buildReplayPlan([{ multiSelect: false, hasPreview: true, optionCount: 3 }], { q0: '0', q0_note: 'ok' });
+  assert.deepEqual(keysOf(plan), [
+    { keys: 'n' }, { text: 'ok', submit: false }, { keys: ESC }, { keys: ENTER },
+  ]);
+});
+
+test('预览题：仅备注不选项 → n + 打字 + Enter（notes only，不按 Esc）', () => {
+  const plan = buildReplayPlan([{ multiSelect: false, hasPreview: true, optionCount: 3 }], { q0_note: '随便' });
+  assert.deepEqual(keysOf(plan), [
+    { keys: 'n' }, { text: '随便', submit: false }, { keys: ENTER },
+  ]);
 });
 
 test('单题多选：逐个切勾选 + RIGHT 切 Submit tab + 末尾 Enter', () => {

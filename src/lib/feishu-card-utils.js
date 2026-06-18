@@ -130,17 +130,23 @@ function buildQuestionsForm(questions, stateKey, ptsDevice) {
     questions.forEach((q, i) => {
         if (i > 0) formEls.push({ tag: 'hr' });
         formEls.push(questionHeading(q));
+        const previews = q.options.filter(o => o && o.preview != null);
+        const isPreview = previews.length > 0;
         // 下拉框塞不下说明，把各选项「标签 — 提示」列成图例，对照着选
         const legend = q.options.filter(o => o.description).map(o => `**${o.label}** ${grey(o.description)}`).join('\n');
         if (legend) formEls.push({ tag: 'markdown', content: legend });
+        // 预览题：渲染各选项的样例预览（ASCII/代码），手机上才看得到「图」；反引号替 ' 防内容里的 ``` 提前闭合围栏（同 claude-live）
+        previews.forEach(o => formEls.push({ tag: 'markdown', content: `**${o.label}**\n\`\`\`\n${String(o.preview).replace(/`/g, "'")}\n\`\`\`` }));
         const options = q.options.map((o, j) => ({ value: String(j), text: { tag: 'plain_text', content: o.label } }));
         formEls.push({
             tag: q.multiSelect ? 'multi_select_static' : 'select_static', name: `q${i}`,
             placeholder: { tag: 'plain_text', content: q.multiSelect ? '勾选（可多选）' : '点击选择' },
             options,
         });
-        // 每题都给自定义框（"Type something"）：单选 Enter、多选文本+空格哨兵，均已验证可靠提交
-        formEls.push({ tag: 'input', name: `q${i}_other`, width: 'fill', placeholder: { tag: 'plain_text', content: '或自定义…（可选）' } });
+        // 预览题无自定义答案，输入框改作「备注」(q{i}_note，附在所选项上)；其余题给「自定义」(q{i}_other)
+        formEls.push(isPreview
+            ? { tag: 'input', name: `q${i}_note`, width: 'fill', placeholder: { tag: 'plain_text', content: '备注：附在所选项上（可选）' } }
+            : { tag: 'input', name: `q${i}_other`, width: 'fill', placeholder: { tag: 'plain_text', content: '或自定义…（可选）' } });
     });
     formEls.push({
         tag: 'button', text: { tag: 'plain_text', content: '✅ 提交全部' }, type: 'primary',
@@ -190,7 +196,9 @@ function buildSubmittedCard(questions, answers, ptsDevice) {
         const picks = selectedIndices(answers, i, q.optionCount, q.multiSelect).map(idx => q.options?.[idx] ?? `#${idx}`);
         const other = (answers[`q${i}_other`] || '').trim();
         if (other) picks.push(other);
-        return `${q.header ? `**${q.header}**　` : ''}${picks.join('、') || '—'}`;
+        const note = (answers[`q${i}_note`] || '').trim();
+        const noteSuffix = note ? `　${grey(`备注：${note}`)}` : '';
+        return `${q.header ? `**${q.header}**　` : ''}${picks.join('、') || '—'}${noteSuffix}`;
     });
     const els = [{ tag: 'markdown', content: lines.join('\n') }, footer('', ptsDevice)];
     return card2({ template: 'green', icon: 'yes_outlined', title: '已提交', elements: els }); // 对勾交给 header 绿色图标
