@@ -45,8 +45,33 @@ test('sendQuestionsForm：单题/多题统一发一张 form 卡，并存回放�
   const notif = sessionState.getNotification('state-form');
   assert.equal(notif._questions_form, true);
   assert.deepEqual(notif._questions, [
-    { multiSelect: false, optionCount: 2, header: '方案', options: ['A', 'B'] },
-    { multiSelect: true, optionCount: 3, header: '水果', options: ['苹果', '梨', '桃'] },
+    { multiSelect: false, optionCount: 2, hasPreview: false, header: '方案', options: ['A', 'B'] },
+    { multiSelect: true, optionCount: 3, hasPreview: false, header: '水果', options: ['苹果', '梨', '桃'] },
   ]);
   sessionState.removeNotification('state-form');
+});
+
+test('sendQuestionsForm：预览题 → 渲染各选项预览 + 备注输入(q{i}_note) + hasPreview 元数据', async () => {
+  const sent = [];
+  await sendQuestionsForm(
+    fakeApp(sent),
+    [{ header: '布局', question: '选哪个？', multiSelect: false, options: [
+      { label: '左', preview: '[x  ]' },
+      { label: '中', preview: '[ x ]' },
+    ] }],
+    'state-preview', 'fifo:/tmp/agent-inject-pts7', 'session-2', 'AskUserQuestion',
+  );
+
+  const card = sent[0];
+  const form = card.body.elements.find(el => el.tag === 'form');
+  // 预览题输入框是「备注」(q0_note)，不是「自定义」(q0_other)
+  const inputs = form.elements.filter(el => el.tag === 'input');
+  assert.deepEqual(inputs.map(i => i.name), ['q0_note']);
+  // 各选项的预览内容被渲染进卡（手机上能看到「图」）
+  const md = JSON.stringify(form.elements.filter(el => el.tag === 'markdown'));
+  assert.ok(md.includes('[x  ]') && md.includes('[ x ]'), '应渲染各选项预览');
+  // 回放元数据带 hasPreview
+  const notif = sessionState.getNotification('state-preview');
+  assert.equal(notif._questions[0].hasPreview, true);
+  sessionState.removeNotification('state-preview');
 });

@@ -263,26 +263,38 @@ function tmuxSendKeys(target, args) {
     });
 }
 
+/** 把按键串翻译成 tmux send-keys 分组：连续字面字符并作一批（文本不丢键、长命令保速度），具名键（方向键/
+ *  Enter/Esc 等）各自成组——会随导航重渲染的 TUI（如预览题）把一条命令里连发的键合并丢键，故须分组逐发；
+ *  方向键还须用原生键名 Up/Down/Left/Right（拆成 Escape/[/字母 同样会被吞）。纯函数、便于单测。返回 [{named, keys:[…]}, …] */
+function planTmuxKeys(keys) {
+    const groups = [];
+    const push = (key, named) => {
+        const last = groups[groups.length - 1];
+        if (!named && last && !last.named) last.keys.push(key);
+        else groups.push({ named, keys: [key] });
+    };
+    for (let i = 0; i < keys.length; i++) {
+        const ch = keys[i];
+        const arrow = ch === '\x1b' && keys[i + 1] === '[' && { A: 'Up', B: 'Down', C: 'Right', D: 'Left' }[keys[i + 2]];
+        if (arrow) { push(arrow, true); i += 2; }
+        else if (ch === '\n' || ch === '\r') push('Enter', true);
+        else if (ch === '\x1b') push('Escape', true);
+        else if (ch === '\t') push('Tab', true);
+        else if (ch === '\x7f' || ch === '\b') push('BSpace', true);
+        else if (ch === '\x15') push('C-u', true);
+        else push(ch, false);
+    }
+    return groups;
+}
+
 /** 通过 tmux send-keys 注入。spawn 直接传 argv，无需 shell quote。 */
 async function injectViaTmux(target, keys) {
-    // 逐字符：特殊键转 key 名，其余原样作为字面 key
-    const args = [];
-    for (const ch of keys) {
-        if (ch === '\n' || ch === '\r') args.push('Enter');
-        else if (ch === '\x1b') args.push('Escape');
-        else if (ch === '\t') args.push('Tab');
-        else if (ch === '\x7f' || ch === '\b') args.push('BSpace');
-        else if (ch === '\x15') args.push('C-u');
-        else args.push(ch);
-    }
+    // 逐组发送、组间 55ms 间隔（分组缘由见 planTmuxKeys）；长文本+Enter 也因此分两组，不会整块涌入被当粘贴。
+    const groups = planTmuxKeys(keys);
     try {
-        // 末尾 Enter 拆开 + 隔 60ms 单独发：否则长文本+Enter 整块涌入被 Claude TUI 当粘贴、Enter 变换行不提交
-        const submit = args.length > 1 && args[args.length - 1] === 'Enter';
-        if (submit) args.pop();
-        if (args.length) await tmuxSendKeys(target, args);
-        if (submit) {
-            await new Promise(r => setTimeout(r, 60));
-            await tmuxSendKeys(target, ['Enter']);
+        for (let g = 0; g < groups.length; g++) {
+            if (g > 0) await new Promise(r => setTimeout(r, 55));
+            await tmuxSendKeys(target, groups[g].keys);
         }
         return true;
     } catch (err) {
@@ -343,6 +355,7 @@ module.exports = {
     resolvePtsDevice,
     injectKeys,
     injectText,
+    planTmuxKeys,
     createTerminalInjector,
     createTerminalRouter,
 };

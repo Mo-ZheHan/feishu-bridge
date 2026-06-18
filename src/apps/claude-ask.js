@@ -84,8 +84,11 @@ async function getFeishuAppClient() {
 
 // ── Card senders ──────────────────────────────────────────
 
-// 回放元数据：单/多选 + 选项数（回放算键序用）+ header/选项 label（提交回显卡用）；中断键所有卡通用
-const replayMeta = q => ({ multiSelect: !!q.multiSelect, optionCount: q.options.length, header: q.header || q.question || '', options: q.options.map(o => o.label) });
+// 预览题：任一选项带 preview 字段（样例图 → TUI 走左右并排布局，无自定义行，靠 'n' 加备注）
+const hasPreview = q => q.options.some(o => o && o.preview != null);
+
+// 回放元数据：单/多选 + 选项数 + hasPreview（算键序用）+ header/选项 label（回显卡用）；中断键所有卡通用
+const replayMeta = q => ({ multiSelect: !!q.multiSelect, optionCount: q.options.length, hasPreview: hasPreview(q), header: q.header || q.question || '', options: q.options.map(o => o.label) });
 
 /** 发卡 + 登记回放 state；meta 区分卡型（_single_select / _questions_form）*/
 async function sendCard(app, card, stateKey, ptsDevice, sessionId, notificationType, meta) {
@@ -147,8 +150,8 @@ async function main() {
     // Attach contextText to question objects for use in card builders
     questions.forEach(q => { q._contextText = contextText; });
 
-    // 单题单选 → 按钮卡（一点即答）；其余（多题 / 单题多选）→ form 卡。两者回放共用 buildReplayPlan
-    if (questions.length === 1 && !questions[0].multiSelect) {
+    // 单题单选(非预览) → 按钮卡（一点即答）；多题/多选/预览题 → form 卡（预览题要选项+备注一起收）。回放都走 buildReplayPlan
+    if (questions.length === 1 && !questions[0].multiSelect && !hasPreview(questions[0])) {
         await sendSingleSelectCard(app, questions[0], stateKey, ptsDevice, sessionId, notificationType);
     } else {
         await sendQuestionsForm(app, questions, stateKey, ptsDevice, sessionId, notificationType);
