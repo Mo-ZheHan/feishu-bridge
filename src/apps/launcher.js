@@ -19,6 +19,7 @@ const LAUNCH = `${ISO_DIR}/host/launch_session.sh`;
 const CODE_DIR = process.env.CLAUDE_LAUNCH_DIR || `${HOME}/Code`;
 const CLAUDE_HOME = process.env.WB_HOST_CLAUDE_HOME || `${HOME}/.config/claude-isolation/claude`;
 const APP_NAME = process.env.WB_APP_NAME || 'workbench-app';
+const DOCKER = process.env.WB_DOCKER || 'docker';
 const CONTAINER_RUN = process.env.WB_CONTAINER_RUN || '/wb/run';
 
 // 项目名安全白名单：进 tmux/ssh 命令前过滤，杜绝注入与空格破句
@@ -60,6 +61,7 @@ const remoteBase = host => HOSTS.overrides[host] || HOSTS.base;
 /**
  * 解析飞书文本命令（纯函数，可单测）。命令前缀只认 `ccc`（与电脑上的入口同名）。返回其中之一：
  *   { kind: 'ccback' }                                          // `ccc back`：接回正在跑的会话
+ *   { kind: 'stop' }                                            // `ccc stop`：结束会话（菜单）
  *   { kind: 'launch', host: null|string, passArgs: string[] }   // host=null 即本地
  *   { kind: 'unknown_host', host }                              // 首实参不是已知主机也不是 flag
  *   { kind: 'ignore' }                                          // 与本工具无关的普通聊天
@@ -70,11 +72,21 @@ function parseLaunchCommand(text, remoteHosts = REMOTE_HOSTS) {
     if (parts[0] !== 'ccc') return { kind: 'ignore' };
     const rest = parts.slice(1);
     if (rest[0] === 'back') return { kind: 'ccback' }; // `ccc back` 接回，与 ccc 本体的子命令一致
+    if (rest[0] === 'stop') return { kind: 'stop' };   // `ccc stop` 结束会话
     if (rest.length && !rest[0].startsWith('-')) {
         if (remoteHosts.includes(rest[0])) return { kind: 'launch', host: rest[0], passArgs: rest.slice(1) };
         return { kind: 'unknown_host', host: rest[0] };
     }
     return { kind: 'launch', host: null, passArgs: rest };
+}
+
+/** 容器 tmux 里正在跑的 claude 会话名（权威来源，与 `ccc ls` / `ccc back` 同源，不依赖 hook 登记文件） */
+function listContainerSessions() {
+    const r = spawnSync(DOCKER, ['exec', '--user', `${process.getuid()}:${process.getgid()}`, APP_NAME,
+        'env', `TMUX_TMPDIR=${CONTAINER_RUN}`, 'tmux', 'list-sessions', '-F', '#{session_name}'],
+        { encoding: 'utf8', timeout: 10000 });
+    if (r.status !== 0) return []; // 无 server 时 tmux 非零退出，即没有会话
+    return (r.stdout || '').split('\n').map(x => x.trim()).filter(x => x.startsWith('claude-'));
 }
 
 /** ~/Code 一级子目录（排除隐藏与含特殊字符的） */
@@ -161,5 +173,5 @@ module.exports = {
     REMOTE_HOSTS, CODE_DIR,
     sessionName, sessionTarget, readHostsConfig, parseLaunchCommand,
     listLocalProjects, listRemoteProjects, launchLocal, launchRemote, remoteBase,
-    projectSlug, listResumableSessions,
+    projectSlug, listResumableSessions, listContainerSessions,
 };

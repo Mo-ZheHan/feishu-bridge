@@ -18,6 +18,7 @@ test('parseLaunchCommand：ccback / 本地 / 远程 / 透传 --resume / 未知�
   const hosts = ['tx_248', 'fitten8'];
   const p = (t) => launcher.parseLaunchCommand(t, hosts);
   assert.deepEqual(p('ccc back'), { kind: 'ccback' });                 // 接回是 `ccc back`（与 ccc 本体一致）
+  assert.deepEqual(p('ccc stop'), { kind: 'stop' });                  // 结束是 `ccc stop`
   assert.deepEqual(p('ccback'), { kind: 'ignore' });                  // 旧的单词 ccback 不再认
   assert.deepEqual(p('ccc'), { kind: 'launch', host: null, passArgs: [] });
   assert.deepEqual(p('ccc --resume'), { kind: 'launch', host: null, passArgs: ['--resume'] });

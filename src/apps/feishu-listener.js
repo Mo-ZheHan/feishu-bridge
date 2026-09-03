@@ -15,7 +15,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const Lark = require('@larksuiteoapi/node-sdk');
 const { SessionState } = require('../lib/session-state');
-const { injectKeys, injectText, tmuxHasSession } = require('../lib/terminal-inject');
+const { injectKeys, injectText, tmuxHasSession, tmuxKill } = require('../lib/terminal-inject');
 const { createFeishuClient } = require('../channels/feishu/feishu-client');
 const { createFeishuInteractionHandler } = require('../channels/feishu/feishu-interaction-handler');
 const { createCodexInputBridge } = require('../adapters/codex/cli-input-bridge');
@@ -171,8 +171,8 @@ class FeishuListener {
         if (!notification) {
             console.log('[feishu-listener] 通知已过期或已处理:', session_state_key);
             // 记录已清（默认 12h 过期）但卡片还在聊天里 → 给诚实提示，不报假「已操作」
-            const isMenu = /^feishu_(ccback|launch|resume)_/.test(session_state_key);
-            return { toast: { type: 'info', content: isMenu ? '该菜单已过期，请重新发送 ccc / ccc back' : '该卡片已过期或已处理' } };
+            const isMenu = /^feishu_(ccback|launch|resume|stop|stopall)_/.test(session_state_key);
+            return { toast: { type: 'info', content: isMenu ? '该菜单已过期，请重新发送 ccc / ccc back / ccc stop' : '该卡片已过期或已处理' } };
         }
 
         // 启动 / 会话选择 / 接回菜单：无 pts_device，须在终端检查前分流
@@ -181,6 +181,12 @@ class FeishuListener {
         }
         if (notification._resume) {
             return this.handleResume(notification, action_type, session_state_key);
+        }
+        if (notification._stop) {
+            return this.handleStopMenu(notification, action_type, session_state_key);
+        }
+        if (notification._stopall) {
+            return this.handleStopAll(notification, action_type, session_state_key);
         }
         if (notification._ccback) {
             return this.handleCcback(notification, action_type, session_state_key);
@@ -287,6 +293,7 @@ class FeishuListener {
         const chatId = msg.chat_id;
         const parsed = launcher.parseLaunchCommand(text);
         if (parsed.kind === 'ccback') return this.sendCcbackMenu(chatId);
+        if (parsed.kind === 'stop') return this.sendStopMenu(chatId);
         if (parsed.kind === 'launch') return this.sendLaunchMenu(chatId, parsed.host, parsed.passArgs);
         if (parsed.kind === 'unknown_host') {
             return this.sendText(chatId, `未知主机「${parsed.host}」。可用：${launcher.REMOTE_HOSTS.join(' ')}\n或直接发 ccc 起本地会话`);
@@ -320,7 +327,8 @@ class FeishuListener {
         await this.sendCardJson(chatId, card2({ template: 'blue', title, elements: els }));
     }
 
-    /** 项目菜单回调：opt_N → 选中项目。带 --resume 则转会话选择菜单；否则直接 detached 起会话 */
+    /** 项目菜单回调：opt_N → 选中项目。复刻 ccc：已有运行中的会话就接回（先于同步/启动/--resume），
+     *  否则带 --resume 转会话选择菜单、其余直接 detached 起会话 */
     async handleLaunch(notification, action_type, stateKey) {
         const i = this.menuIndex(action_type);
         if (i < 0) return;
@@ -328,8 +336,20 @@ class FeishuListener {
         if (!proj) return '选项无效';
         this.state.removeNotification(stateKey);
         const { host, passArgs = [] } = notification;
+        if (this.reattachIfRunning(notification.chat_id, host, proj)) return '接回已有会话';
         if (passArgs.includes('--resume')) return this.sendSessionMenu(notification.chat_id, host, proj, passArgs);
         return this.startAndAnnounce(notification.chat_id, host, proj, passArgs);
+    }
+
+    /** ccc 的 reattach_if_running：该项目已有运行中的会话 → 直接接回、不重复创建、远程也不重新同步。
+     *  命中则发「接回」卡并返回 true（fire-and-forget，卡里带输入框直接发指令）。 */
+    reattachIfRunning(chatId, host, proj) {
+        const name = launcher.sessionName(proj, host);
+        const target = launcher.sessionTarget(name);
+        if (!tmuxHasSession(target.replace(/^tmux:/, ''))) return false;
+        const label = host ? `${host}:${proj}` : proj;
+        this.sendSessionCard(chatId, label, name, target, { reattached: true });
+        return true;
     }
 
     /** 会话选择菜单：把该项目可恢复的会话列成按钮（最近活动 + 首条 prompt），让用户在飞书上直接挑，
@@ -394,36 +414,107 @@ class FeishuListener {
         const deadline = Date.now() + 180000;
         while (Date.now() < deadline) {
             await sleep(2500);
-            if (tmuxHasSession(spec)) { await this.sendLaunchedCard(chatId, label, name, target); return; }
+            if (tmuxHasSession(spec)) { await this.sendSessionCard(chatId, label, name, target, { reattached: false }); return; }
         }
         await this.sendText(chatId, `⚠️ ${label} 迟迟未就绪，请在电脑上 ccc back 查看`);
     }
 
-    /** 「已启动」卡：绿卡 + 输入框，可直接发第一条指令 */
-    async sendLaunchedCard(chatId, label, name, target) {
-        const card = card2({ template: 'green', title: `已启动 · ${label}`, elements: [{ tag: 'markdown', content: '在下方直接发指令给它。' }] });
+    /** 会话卡：绿「已启动」/ 蓝「接回已有会话」+ 输入框，可直接发指令 */
+    async sendSessionCard(chatId, label, name, target, { reattached = false } = {}) {
+        const [template, title, intro] = reattached
+            ? ['blue', `接回已有会话 · ${label}`, '已有正在运行的会话，直接接回，在下方发指令。']
+            : ['green', `已启动 · ${label}`, '在下方直接发指令给它。'];
+        const card = card2({ template, title, elements: [{ tag: 'markdown', content: intro }] });
         this.bindSessionInput(card, name, target);
         await this.sendCardJson(chatId, card);
     }
 
-    /** hook 登记过、且 tmux 会话仍在的 claude 会话：[{ name, transcript, target, statsDir }]。登记文件失活即清掉 */
+    /** 正在跑的 claude 会话：[{ name, target, transcript, statsDir }]。
+     *  权威来源是容器 tmux（与 `ccc ls`/`ccc back` 同源），再用 hook 落盘的 /tmp 文件补
+     *  transcript/statsDir；没登记文件的会话也照样能列、能接回、能结束（target 由会话名推导）。
+     *  顺带清掉已不在容器里的陈旧登记文件。 */
     listSessions() {
-        let names;
-        try { names = fs.readdirSync(SESSION_FILE_DIR); } catch { return []; }
-        const sessions = [];
-        for (const f of names) {
-            const m = SESSION_FILE_RE.exec(f);
-            if (!m) continue;
-            const file = path.join(SESSION_FILE_DIR, f);
-            let info;
-            try { info = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
-            if (!info.target || !tmuxHasSession(info.target.replace(/^tmux:/, ''))) {
-                try { fs.unlinkSync(file); } catch {}
-                continue;
+        const live = launcher.listContainerSessions();
+        const liveSet = new Set(live);
+        try {
+            for (const f of fs.readdirSync(SESSION_FILE_DIR)) {
+                const m = SESSION_FILE_RE.exec(f);
+                if (m && !liveSet.has(m[1])) fs.unlinkSync(path.join(SESSION_FILE_DIR, f));
             }
-            sessions.push({ name: m[1], ...info });
+        } catch {}
+        return live.map(name => {
+            let info = {};
+            try { info = JSON.parse(fs.readFileSync(path.join(SESSION_FILE_DIR, `claude-tmux-${name}.json`), 'utf8')); } catch {}
+            return {
+                name,
+                target: info.target || launcher.sessionTarget(name),
+                transcript: info.transcript || null,
+                statsDir: info.statsDir || null,
+            };
+        }).sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    /** ccc stop：列运行中的会话，点单个即结束（danger，带名字）；「全部结束」需二次确认（会连训练监控一起杀） */
+    async sendStopMenu(chatId) {
+        const sessions = this.listSessions();
+        if (!sessions.length) return this.sendText(chatId, '没有正在运行的 claude 会话');
+        const stateKey = `feishu_stop_${Date.now()}`;
+        this.state.addNotification(stateKey, {
+            created_at: Date.now(), _stop: true, chat_id: chatId,
+            sessions: sessions.map(s => ({ name: s.name, target: s.target })),
+        });
+        const els = [{ tag: 'markdown', content: '结束哪个会话？（点击即结束，不可撤销）' }];
+        sessions.forEach((sess, i) => els.push({
+            tag: 'button', text: { tag: 'plain_text', content: `⛔ ${sess.name}` }, type: 'danger',
+            value: { action_type: `opt_${i}`, session_state_key: stateKey },
+        }));
+        els.push({
+            tag: 'button', text: { tag: 'plain_text', content: `⛔ 全部结束（${sessions.length}）` }, type: 'danger',
+            value: { action_type: 'all', session_state_key: stateKey },
+        });
+        await this.sendCardJson(chatId, card2({ template: 'red', title: '结束会话', elements: els }));
+    }
+
+    /** 结束菜单回调：opt_N → 结束该会话；all → 转全部结束的确认卡 */
+    async handleStopMenu(notification, action_type, stateKey) {
+        const { sessions = [], chat_id } = notification;
+        if (action_type === 'all') {
+            this.state.removeNotification(stateKey);
+            await this.sendStopAllConfirm(chat_id, sessions);
+            return '请确认';
         }
-        return sessions.sort((a, b) => a.name.localeCompare(b.name));
+        const i = this.menuIndex(action_type);
+        if (i < 0) return;
+        const sess = sessions[i];
+        if (!sess) return '选项无效';
+        this.state.removeNotification(stateKey);
+        const ok = tmuxKill(sess.target.replace(/^tmux:/, ''));
+        // 结束后清掉它的登记文件（listSessions 也会自愈，这里即时清）
+        try { require('fs').unlinkSync(`/tmp/claude-tmux-${sess.name}.json`); } catch {}
+        return ok ? `已结束 ${sess.name}` : { toast: { type: 'error', content: `结束失败：${sess.name}` } };
+    }
+
+    /** 全部结束的确认卡（不可撤销，会连正在跑活的会话一起杀，故二次确认） */
+    async sendStopAllConfirm(chatId, sessions) {
+        const stateKey = `feishu_stopall_${Date.now()}`;
+        this.state.addNotification(stateKey, { created_at: Date.now(), _stopall: true, chat_id: chatId, anyTarget: sessions[0]?.target || null });
+        const danger = { tag: 'button', text: { tag: 'plain_text', content: '⛔ 确认全部结束' }, type: 'danger', width: 'fill', value: { action_type: 'confirm', session_state_key: stateKey } };
+        const cancel = { tag: 'button', text: { tag: 'plain_text', content: '取消' }, type: 'default', width: 'fill', value: { action_type: 'cancel', session_state_key: stateKey } };
+        await this.sendCardJson(chatId, card2({ template: 'red', title: '确认全部结束', elements: [
+            { tag: 'markdown', content: `将结束全部 ${sessions.length} 个会话，**不可撤销**（含正在跑活的会话）。确认？` },
+            { tag: 'column_set', horizontal_spacing: '8px', columns: [
+                { tag: 'column', width: 'weighted', weight: 1, elements: [danger] },
+                { tag: 'column', width: 'weighted', weight: 1, elements: [cancel] },
+            ] },
+        ] }));
+    }
+
+    /** 全部结束确认回调：confirm → kill-server；其余取消 */
+    async handleStopAll(notification, action_type, stateKey) {
+        this.state.removeNotification(stateKey);
+        if (action_type !== 'confirm') return '已取消';
+        const ok = notification.anyTarget && tmuxKill(notification.anyTarget.replace(/^tmux:/, ''), { server: true });
+        return ok ? '已结束全部会话' : { toast: { type: 'error', content: '结束失败' } };
     }
 
     /** 发会话选择菜单卡（正在运行的 claude 会话，opt_N → items[N]） */

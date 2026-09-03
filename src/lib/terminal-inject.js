@@ -53,6 +53,15 @@ function tmuxSessionName(spec) {
     return parseTmuxTarget(spec).target.replace(/^=/, '').split(/[:.]/)[0];
 }
 
+/** 结束会话（server:true 则结束整个 tmux server = 全部会话）。同步；成功返 true */
+function tmuxKill(spec, { server = false } = {}) {
+    try {
+        const { target, argv } = parseTmuxTarget(spec);
+        const args = server ? ['kill-server'] : ['kill-session', '-t', target];
+        return spawnSync(argv[0], [...argv.slice(1), ...args], { stdio: 'ignore', timeout: 10000 }).status === 0;
+    } catch { return false; }
+}
+
 /** 该 tmux server 上会话是否存活（同步；docker exec 一次 ~150ms） */
 function tmuxHasSession(spec) {
     try {
@@ -400,5 +409,6 @@ module.exports = {
     parseTmuxTarget,
     tmuxSessionName,
     tmuxHasSession,
+    tmuxKill,
     createTerminalInjector,
 };
