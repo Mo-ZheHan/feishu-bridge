@@ -1,5 +1,5 @@
 {
-  "$schema": "/Users/csrobo/.nvm/versions/node/v20.20.2/lib/node_modules/ccusage/config-schema.json",
+  "$schema": "/Users/csrobo/.nvm/versions/node/v24.19.0/lib/node_modules/ccusage/config-schema.json",
   "defaults": {
     "timezone": "Asia/Shanghai",
     "mode": "auto",

@@ -6,94 +6,37 @@
  *   Stop         - 任务完成，携带最后一条助手消息
  *   Notification - 等待用户操作（权限确认、方案选择等）
  *   StopFailure  - 异常退出（API 错误等）
+ *   SessionStart - 不发卡，只登记「tmux 会话 → transcript / 终端目标」供 ccc back 用
  */
 
 const fs = require('fs');
-const path = require('path');
-const { envConfig } = require('../lib/env-config');
+const { feishuEnabled } = require('../lib/env-config');
 const { sessionState } = require('../lib/session-state');
-const { resolvePtsDevice } = require('../lib/terminal-inject');
-const Lark = require('@larksuiteoapi/node-sdk');
+const { resolvePtsDevice, tmuxSessionName } = require('../lib/terminal-inject');
 const { parseMarkdownToElements } = require('../lib/feishu-card-utils');
-const { card2, statsTags, inputEl, buttonRow, footer, escFooterRow } = require('../lib/card');
+const { card2, statsTags, statsSubtitle, inputEl, buttonRow, footer, escFooterRow } = require('../lib/card');
 const { forEachTail, findTail, getAssistantText } = require('../lib/transcript-utils');
-const { fmtDuration, readOfficialStats } = require('../lib/session-stats');
+const { readOfficialStats } = require('../lib/session-stats');
+const { getFeishuAppClient, sendCard: sendFeishuCard } = require('../lib/feishu-app');
+const { readStdinJson } = require('../lib/stdin-json');
 const { KEY_TOOLS } = require('../lib/key-tools');
-
-// ── 会话统计 ─────────────────────────────────────────────
-
-function parseSessionStats(transcriptPath) {
-    if (!transcriptPath) return null;
-    try {
-        const raw = fs.readFileSync(transcriptPath, 'utf8').trim();
-        if (!raw) return null;
-
-        const timestamps = [];
-        for (const line of raw.split('\n')) {
-            let d;
-            try { d = JSON.parse(line); } catch { continue; }
-            if (d.timestamp) timestamps.push(d.timestamp);
-        }
-
-        const duration = timestamps.length >= 2
-            ? fmtDuration(new Date(timestamps[timestamps.length - 1]) - new Date(timestamps[0]))
-            : '';
-
-        return { duration };
-    } catch {
-        return null;
-    }
-}
 
 // ── 工具函数 ─────────────────────────────────────────────
 
-/** 从 transcript 提取最近的 AskUserQuestion 数据及上下文文本 */
+/** 最后一条 assistant 消息里的 AskUserQuestion 输入及其前置文本；最后一条不含则 null */
 function extractAskUserQuestion(transcriptPath) {
-    if (!transcriptPath) return null;
-    try {
-        const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
-        // 只检查最后一条 assistant 消息，避免读到更早的 AskUserQuestion
-        for (let i = lines.length - 1; i >= 0; i--) {
-            let d;
-            try { d = JSON.parse(lines[i]); } catch { continue; }
-            if (d.type !== 'assistant') continue;
-            // 找到最后一条 assistant 消息，检查是否包含 AskUserQuestion
-            const content = d.message?.content || [];
-            let askInput = null;
-            let contextText = '';
-            for (const block of content) {
-                if (block.type === 'text' && block.text) {
-                    contextText += block.text + '\n';
-                }
-                if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
-                    askInput = block.input;
-                }
-            }
-            if (askInput) {
-                askInput._contextText = contextText.trim();
-                return askInput;
-            }
-            return null;
+    return findTail(transcriptPath, (d) => {
+        if (d.type !== 'assistant') return undefined;
+        let askInput = null;
+        let contextText = '';
+        for (const block of d.message?.content || []) {
+            if (block.type === 'text' && block.text) contextText += block.text + '\n';
+            if (block.type === 'tool_use' && block.name === 'AskUserQuestion') askInput = block.input;
         }
-    } catch {}
-    return null;
-}
-
-function readStdin() {
-    return new Promise((resolve) => {
-        let data = '';
-        let resolved = false;
-        const done = (val) => { if (!resolved) { resolved = true; resolve(val); } };
-
-        process.stdin.setEncoding('utf8');
-        process.stdin.on('data', chunk => data += chunk);
-        process.stdin.on('end', () => {
-            try { done(JSON.parse(data)); }
-            catch { done({}); }
-        });
-        // 兜底防 stdin 卡死；.unref() 让 timer 不阻塞进程退出
-        setTimeout(() => done({}), 3000).unref();
-    });
+        if (!askInput) return null; // 最后一条 assistant 消息不是问卷：到此为止，别往更早的问卷翻
+        askInput._contextText = contextText.trim();
+        return askInput;
+    }) || null;
 }
 
 /** session 是否 bypass：先看 payload，否则 transcript 反扫 permissionMode */
@@ -104,23 +47,24 @@ function isBypassMode(data) {
     ) === true;
 }
 
-function getProjectName(cwd) {
-    if (!cwd) return '';
+/** 登记 tmux 会话 → 当前 transcript / 终端目标 / 统计目录，供 ccc back 按会话精确定位（同目录多会话也不混） */
+function registerTmuxSession(target, data) {
+    if (!target?.startsWith('tmux:') || !data.transcript_path) return;
     try {
-        const pkgPath = path.join(cwd, 'package.json');
-        if (fs.existsSync(pkgPath)) {
-            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-            if (pkg.name) return pkg.name;
-        }
+        fs.writeFileSync(`/tmp/claude-tmux-${tmuxSessionName(target.slice(5))}.json`, JSON.stringify({
+            transcript: data.transcript_path,
+            target,
+            statsDir: process.env.CLAUDE_STATS_DIR || null,
+            session_id: data.session_id || null,
+        }));
     } catch {}
-    return path.basename(cwd);
 }
 
 // ── 卡片构建 ─────────────────────────────────────────────
 
-/** Stop / StopFailure 卡：会话名作副标题，时长/成本等官方字段作 header 标签，正文为 body；输入框与 footer 由发送侧补 */
+/** Stop / StopFailure 卡：会话名·成本作副标题，上下文/限额作 header 标签，正文为 body；输入框与 footer 由发送侧补 */
 function buildCard(title, body, template, stats) {
-    return card2({ template, title, subtitle: stats?.sessionName, tags: statsTags(stats), elements: parseMarkdownToElements(body) });
+    return card2({ template, title, subtitle: statsSubtitle(stats), tags: statsTags(stats), elements: parseMarkdownToElements(body) });
 }
 
 // ── 事件处理 ─────────────────────────────────────────────
@@ -165,60 +109,46 @@ function handleStop(data, getStats) {
     return buildCard('Claude 完成', shown, 'green', getStats());
 }
 
-// 官方错误码 → 中文标题；未命中则统一「异常退出」
-const ERROR_TITLES = {
-    rate_limit: 'API 频率限制',
-    authentication_failed: '认证失败',
-    billing_error: '计费错误',
-    server_error: '服务器错误',
-    max_output_tokens: '输出超长',
-    invalid_request: '请求无效',
+// 官方错误码 → { 标题, 兜底正文 }。标题与兜底同源，二者不会漂移；正文按下面 handleStopFailure 的
+// 顺序取，兜底是最后一档，保证卡片正文永远贴合当前这次失败、不会翻出历史消息。未知码退回通用条目。
+const ERROR_INFO = {
+    rate_limit:            { title: 'API 频率限制', hint: '已触发使用限额，需等待窗口重置。' },
+    authentication_failed: { title: '认证失败',     hint: '认证失败：凭据无效或已过期。' },
+    billing_error:         { title: '计费错误',     hint: '账户计费异常。' },
+    server_error:          { title: '服务器错误',   hint: 'API 服务器错误（如 529 Overloaded），通常是暂时的，稍后重试即可。' },
+    max_output_tokens:     { title: '输出超长',     hint: '单次输出超过上限。' },
+    invalid_request:       { title: '请求无效',     hint: '请求被拒绝。' },
 };
+const UNKNOWN_ERROR = { title: '异常退出', hint: '发生未知错误。' };
 
-/** payload 不带 error_details 时，反扫 transcript 取最近一条 API 错误助手消息的原文 */
-function latestApiError(transcriptPath) {
-    return findTail(transcriptPath, (d) =>
-        d.type === 'assistant' && d.isApiErrorMessage ? getAssistantText(d) || undefined : undefined
-    );
+// StopFailure 在错误后立即触发，真正的原因就在 transcript 末尾的几秒之内。更早的 isApiErrorMessage 是
+// 历史遗留（如今早触发过限额、早已重置），贴到当前这次失败上只会张冠李戴。反扫时最近一条一旦超过这个
+// 窗口，就当作 transcript 里没有当前错误，让正文回退到按错误码的兜底文案。
+const RECENT_ERROR_MS = 2 * 60 * 1000;
+
+/** transcript 末尾最近一条 API 错误的原文，且必须新鲜（RECENT_ERROR_MS 内）；否则 undefined。
+ *  反扫最先遇到的即最近一条：新鲜则用，过期则以 null 终止扫描（更早的只会更旧、无需再看）。 */
+function recentApiError(transcriptPath, now = Date.now()) {
+    return findTail(transcriptPath, (d) => {
+        if (d.type !== 'assistant' || !d.isApiErrorMessage) return undefined;
+        const fresh = d.timestamp && now - new Date(d.timestamp).getTime() <= RECENT_ERROR_MS;
+        return fresh ? (getAssistantText(d) || undefined) : null;
+    }) || undefined;
 }
 
-/** StopFailure：标题取官方错误码映射，正文为错误原文 */
+/** StopFailure：标题按错误码；正文取 error_details → 新鲜的 transcript 错误 → 按错误码的兜底，三者同源不串台 */
 function handleStopFailure(data, getStats) {
-    const title = ERROR_TITLES[data.error] || '异常退出';
-    const details = data.error_details || latestApiError(data.transcript_path) || '发生未知错误';
-    return buildCard(title, details, 'red', getStats());
+    const info = ERROR_INFO[data.error] || UNKNOWN_ERROR;
+    const details = data.error_details || recentApiError(data.transcript_path) || info.hint;
+    return buildCard(info.title, details, 'red', getStats());
 }
 
-// ── 飞书自建应用 API 发送卡片 ──────────────────────────────
-
-/** 获取飞书自建应用 client 和 chatId，无配置则返回 null */
-async function getFeishuAppClient() {
-    const appId = process.env.FEISHU_APP_ID;
-    const appSecret = process.env.FEISHU_APP_SECRET;
-    if (!appId || !appSecret) return null;
-
-    const client = new Lark.Client({ appId, appSecret });
-
-    let chatId = process.env.FEISHU_CHAT_ID;
-    if (!chatId) {
-        try {
-            const resp = await client.im.chat.list({ params: { page_size: 5 } });
-            const chats = resp?.data?.items || [];
-            if (chats.length === 0) return null;
-            chatId = chats[0].chat_id;
-        } catch { return null; }
-    }
-
-    return { client, chatId };
-}
+// ── 发送 ─────────────────────────────────────────────────
 
 /** 发卡 + 注册回调路由：发送成功才记 sessionState；esc/interrupt 通用中断键在此统一注入 */
 async function sendCard(app, card, { stateKey, sessionId, type, ptsDevice, responses = {} }) {
     try {
-        await app.client.im.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: { receive_id: app.chatId, msg_type: 'interactive', content: JSON.stringify(card) },
-        });
+        await sendFeishuCard(app, card);
         sessionState.addNotification(stateKey, {
             session_id: sessionId,
             notification_type: type,
@@ -235,8 +165,8 @@ async function sendCard(app, card, { stateKey, sessionId, type, ptsDevice, respo
     }
 }
 
-/** 通过自建应用 API 发送普通卡片（Stop / StopFailure） */
-async function sendFeishuAppCard(data, event, getStats) {
+/** 普通卡片（Stop / StopFailure） */
+async function sendFeishuAppCard(data, event, getStats, ptsDevice) {
     const handler = { Stop: handleStop, StopFailure: handleStopFailure }[event];
     if (!handler) return;
 
@@ -247,7 +177,6 @@ async function sendFeishuAppCard(data, event, getStats) {
     if (!app) return;
 
     // 末尾补输入框（卡片直接回话）+ 中断按钮与终端 id 同行
-    const ptsDevice = resolvePtsDevice(process.ppid);
     const sessionId = data.session_id || '';
     const stateKey = `feishu_${sessionId.substring(0, 8)}_${Date.now()}`;
     card.body.elements.push(inputEl(stateKey), escFooterRow(stateKey, ptsDevice));
@@ -274,7 +203,7 @@ function describeLatestTool(transcriptPath, fallback) {
     }) ?? fallback;
 }
 
-/** 从 pty 输出文件解析终端实际的 Yes/No 编号选项 */
+/** 从 pty-relay 的输出文件解析终端实际的 Yes/No 编号选项（仅 pty-relay 路径有此文件） */
 function parsePermissionOptions(ptsDevice) {
     const m = ptsDevice?.match(/pts(\d+)/);
     if (!m) return [];
@@ -322,14 +251,13 @@ function buildPermissionButtons(parsedOptions) {
 }
 
 /** bypass 下 PreToolUse 不触发，从 transcript 检测 AskUserQuestion 并委托 claude-ask 发选择卡。已处理返 true */
-async function tryAskUserQuestion(app, data, { sessionPrefix, sessionId }) {
+async function tryAskUserQuestion(app, data, { sessionPrefix, sessionId, ptsDevice }) {
     const askInput = extractAskUserQuestion(data.transcript_path);
     const questions = Array.isArray(askInput?.questions) ? askInput.questions : [];
     if (!questions.length) return false;
 
     const { sendSingleSelectCard, sendQuestionsForm } = require('./claude-ask');
     questions.forEach(q => { q._contextText = askInput._contextText || ''; });
-    const ptsDevice = resolvePtsDevice(process.ppid);
     const stateKey = `feishu_ask_${sessionPrefix}_${Date.now()}`;
 
     // 单题单选 → 按钮卡；其余 → form 卡。两者回放共用 buildReplayPlan
@@ -342,7 +270,7 @@ async function tryAskUserQuestion(app, data, { sessionPrefix, sessionId }) {
 }
 
 /** 飞书交互卡片（Notification 事件，带回调按钮）。main 已过滤 idle/elicitation，只剩 permission_prompt */
-async function sendFeishuInteractiveCard(data, getStats) {
+async function sendFeishuInteractiveCard(data, getStats, ptsDevice) {
     const app = await getFeishuAppClient();
     if (!app) return;
 
@@ -355,9 +283,8 @@ async function sendFeishuInteractiveCard(data, getStats) {
         .some(([k, v]) => k.startsWith(`feishu_ask_${sessionPrefix}`) && Date.now() - (v.created_at || 0) < 30000);
     if (hasRecentAsk) return;
 
-    if (await tryAskUserQuestion(app, data, { sessionPrefix, sessionId })) return;
+    if (await tryAskUserQuestion(app, data, { sessionPrefix, sessionId, ptsDevice })) return;
 
-    const ptsDevice = resolvePtsDevice(process.ppid);
     const stateKey = `feishu_${sessionPrefix}_${Date.now()}`;
     const toolDesc = describeLatestTool(data.transcript_path, data.message || '需要你的操作');
     const { buttons, responses } = buildPermissionButtons(parsePermissionOptions(ptsDevice));
@@ -380,39 +307,33 @@ async function sendFeishuInteractiveCard(data, getStats) {
 // ── 主流程 ───────────────────────────────────────────────
 
 async function main() {
-    const data = await readStdin();
+    const data = await readStdinJson();
     const event = data.hook_event_name;
     if (!event) return;
+    if (!feishuEnabled()) return;
 
-    if (!envConfig.getFeishuAppConfig().enabled) return;
+    // 终端目标只解析一次（bridge 给了 CLAUDE_TMUX_TARGET 时零开销；否则沿进程树跑 ps）
+    const ptsDevice = resolvePtsDevice(process.ppid);
+    // SessionStart 让会话一启动/clear/compact 就登记；其它事件顺手刷新。空否交由 ccc back 读 transcript 判断
+    registerTmuxSession(ptsDevice, data);
 
-    // 登记 tmux 会话名 → 当前 transcript，供 ccback 按会话精确定位（同目录多会话也不混）。
-    // SessionStart 让会话一启动/clear/compact 就登记；空否交由 ccback 读 transcript 内容判断
-    const tmuxPts = resolvePtsDevice(process.ppid);
-    if (tmuxPts?.startsWith('tmux:') && data.transcript_path) {
-        try { fs.writeFileSync(`/tmp/claude-tmux-${tmuxPts.slice(5).split(':')[0]}.json`, JSON.stringify({ transcript: data.transcript_path })); } catch {}
-    }
-
-    // 懒求值：优先用 statusLine 旁路落盘的官方成本/时长（与状态栏同源），无则回退 transcript 时长
+    // 懒求值：statusLine 旁路落盘的官方成本/上下文/限额（与状态栏同源）；没有就不挂标签
     let statsVal, statsDone = false;
     const getStats = () => {
         if (!statsDone) {
-            statsVal = readOfficialStats(data.session_id) || parseSessionStats(data.transcript_path) || {};
+            statsVal = readOfficialStats(data.session_id) || {};
             statsDone = true;
         }
         return statsVal;
     };
 
-    const tasks = [];
     if (event === 'Notification') {
         const type = data.notification_type || '';
         if (type === 'permission_prompt') {
             // bypass 模式跳过（Notification payload 不带 mode，看 transcript）
             if (isBypassMode(data)) return;
-            const ptsDevice = resolvePtsDevice(process.ppid);
             sessionState.load();
-            const meta = sessionState.data['__meta__'] || {};
-            const autoDevices = meta.autoApproveDevices || [];
+            const autoDevices = sessionState.data['__meta__']?.autoApproveDevices || [];
             if (autoDevices.includes(ptsDevice)) {
                 const { injectKeys } = require('../lib/terminal-inject');
                 injectKeys(ptsDevice, '2').catch(() => {});
@@ -420,14 +341,10 @@ async function main() {
             }
         }
         if (type !== 'idle_prompt' && type !== 'elicitation_dialog') {
-            tasks.push(sendFeishuInteractiveCard(data, getStats));
+            await sendFeishuInteractiveCard(data, getStats, ptsDevice);
         }
     } else {
-        tasks.push(sendFeishuAppCard(data, event, getStats));
-    }
-
-    if (tasks.length > 0) {
-        await Promise.allSettled(tasks);
+        await sendFeishuAppCard(data, event, getStats, ptsDevice);
     }
 }
 
@@ -439,4 +356,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { main, handleStopFailure, latestApiError };
+module.exports = { main, handleStopFailure, recentApiError, extractAskUserQuestion, registerTmuxSession };

@@ -2,12 +2,12 @@
 
 const Lark = require('@larksuiteoapi/node-sdk');
 
-function createFeishuClient({ appId, appSecret }) {
+function createFeishuClient({ appId, appSecret, loggerLevel }) {
     if (!appId || !appSecret) {
         throw new Error('createFeishuClient requires appId and appSecret');
     }
 
-    const client = new Lark.Client({ appId, appSecret });
+    const client = new Lark.Client(loggerLevel === undefined ? { appId, appSecret } : { appId, appSecret, loggerLevel });
 
     return {
         client,

@@ -19,6 +19,8 @@ const path = require('path');
 require('../lib/env-config'); // 加载 .env
 const { card2, termLabel } = require('../lib/card');
 const { resolvePtsDevice } = require('../lib/terminal-inject');
+const { currentTurn } = require('../lib/transcript-utils');
+const { readStdinJson } = require('../lib/stdin-json');
 const { KEY_TOOLS } = require('../lib/key-tools');
 
 const TOOL_ICONS = {
@@ -69,20 +71,6 @@ function parseCaptureConfig() {
         output: parts.includes('output'),
         results: parts.includes('results'),
     };
-}
-
-function readStdin() {
-    return new Promise((resolve) => {
-        let data = '';
-        let resolved = false;
-        const done = (val) => { if (!resolved) { resolved = true; resolve(val); } };
-        process.stdin.setEncoding('utf8');
-        process.stdin.on('data', chunk => data += chunk);
-        process.stdin.on('end', () => {
-            try { done(JSON.parse(data)); } catch { done({}); }
-        });
-        setTimeout(() => done({}), 3000).unref();
-    });
 }
 
 function getProjectName(cwd) {
@@ -163,23 +151,15 @@ function formatToolResult(toolResponse) {
 function hashStr(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; }
 
 /** 从 transcript 重建当前 turn（到上一条 user prompt 为止）的「文字段 → 其后工具」结构。
- *  text 块起一个新段，其后的 KEY_TOOLS 工具归入该段；tool_result 按 tool_use_id 回填。返回 { turnTs, segments } */
+ *  text 块起一个新段，其后的 KEY_TOOLS 工具归入该段；tool_result 按 tool_use_id 回填。返回 { turnTs, segments }
+ *  只从文件尾读到本 turn 的边界（transcript 会长到几百 MB，整文件读是每次工具调用几百 MB 的分配） */
 function reconstructSegments(transcriptPath) {
-    let raw;
-    try { raw = fs.readFileSync(transcriptPath, 'utf8'); } catch { return { turnTs: 0, segments: [] }; }
-    const lines = raw.trim().split('\n');
-    let start = 0, turnTs = 0;
-    for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-            const d = JSON.parse(lines[i]);
-            if (d.type === 'user' && typeof d.message?.content === 'string') { start = i + 1; turnTs = +new Date(d.timestamp || 0); break; }
-        } catch {}
-    }
+    const { boundary, records } = currentTurn(transcriptPath);
+    const turnTs = boundary ? +new Date(boundary.timestamp || 0) : 0;
     const segments = [];
     const resultMap = {};
     let cur = null;
-    for (let i = start; i < lines.length; i++) {
-        let d; try { d = JSON.parse(lines[i]); } catch { continue; }
+    for (const d of records) {
         if (d.type === 'assistant') {
             for (const b of d.message?.content || []) {
                 if (b.type === 'text' && b.text?.trim()) {
@@ -324,7 +304,7 @@ async function main() {
     const capture = parseCaptureConfig();
     if (!capture) return;
 
-    const data = await readStdin();
+    const data = await readStdinJson();
     if (data.hook_event_name !== 'PostToolUse') return;
 
     const toolName = data.tool_name;
@@ -340,8 +320,8 @@ async function main() {
     // 追加 entry 到缓冲文件
     fs.appendFileSync(bufferPath, JSON.stringify(entry) + '\n', 'utf8');
 
-    // spawn 延迟 flush 子进程（detached，主进程无需等待）
-    const child = require('child_process').spawn('node', [
+    // spawn 延迟 flush 子进程（detached，主进程无需等待）。process.execPath：不依赖 PATH 上有 node
+    const child = require('child_process').spawn(process.execPath, [
         __filename, '--flush', bufferPath
     ], { detached: true, stdio: 'ignore', env: process.env });
     child.unref();
@@ -392,30 +372,13 @@ async function flushBuffer(bufferPath) {
     // 从 bufferPath 派生 sessionKey，用于在 session-state 中存储 message_id
     const sessionKey = path.basename(bufferPath, '.jsonl').replace('claude-live-', '');
 
-    // 加载 env-config（dotenv）获取飞书凭证
-    const { envConfig } = require('../lib/env-config');
-    void envConfig;
-
-    const appId = process.env.FEISHU_APP_ID;
-    const appSecret = process.env.FEISHU_APP_SECRET;
-    if (!appId || !appSecret) return;
-
-    const Lark = require('@larksuiteoapi/node-sdk');
-    const client = new Lark.Client({ appId, appSecret });
-
-    let chatId = process.env.FEISHU_CHAT_ID;
-    if (!chatId) {
-        try {
-            const resp = await client.im.chat.list({ params: { page_size: 5 } });
-            const chats = resp?.data?.items || [];
-            if (!chats.length) return;
-            chatId = chats[0].chat_id;
-        } catch { return; }
-    }
+    const { getFeishuAppClient, sendCard, patchCard } = require('../lib/feishu-app');
+    const app = await getFeishuAppClient();
+    if (!app) return;
 
     // ── 加载 session state（按段索引追踪各卡 message_id）──────────────────────
     const { sessionState } = require('../lib/session-state');
-    await sessionState.load();
+    sessionState.load();
 
     const stateKey = 'live_msg_' + sessionKey;
     const existing = sessionState.data[stateKey];
@@ -432,7 +395,6 @@ async function flushBuffer(bufferPath) {
     // 整轮合并成一张卡：同 turn 复用 message_id、仅内容变时 patch（新工具静默并入同卡）；跨 turn 才新发，响一次通知
     const card = buildSummaryCard(withTools, projectName, capture, ptsDevice);
     const sig = hashStr(JSON.stringify(card.body.elements));
-    const content = JSON.stringify(card);
     const sameTurn = !!(existing && existing.turnTs === turnTs && existing.message_id);
 
     let messageId = sameTurn ? existing.message_id : null;
@@ -440,17 +402,12 @@ async function flushBuffer(bufferPath) {
 
     if (messageId) {
         if (storedSig !== sig) {
-            try { await client.im.message.patch({ path: { message_id: messageId }, data: { content } }); storedSig = sig; }
+            try { await patchCard(app, messageId, card); storedSig = sig; }
             catch (err) { console.error('[live/flush] patch 失败:', err.message); }
         }
     } else {
-        try {
-            const r = await client.im.message.create({
-                params: { receive_id_type: 'chat_id' },
-                data: { receive_id: chatId, msg_type: 'interactive', content },
-            });
-            messageId = r?.data?.message_id || null; storedSig = sig;
-        } catch (err) { console.error('[live/flush] 发送失败:', err.message); }
+        try { messageId = await sendCard(app, card); storedSig = sig; }
+        catch (err) { console.error('[live/flush] 发送失败:', err.message); }
     }
 
     if (messageId) {

@@ -3,11 +3,18 @@
  * 向终端注入按键，用于自动响应 Claude Code 的交互式提示
  *
  * 注入策略（按优先级）:
- *   1. tmux send-keys — 如果进程运行在 tmux 中，最可靠
- *   2. FIFO 中继    — relay.js 运行时，通过 FIFO 管道传递
- *   3. pty master 写入 — 扫描 /proc 找到 pty master fd 直接写入
- *   4. TIOCSTI ioctl  — Linux 受限环境下的备用方案
- *   5. 显式 CLAUDE_TMUX_TARGET 环境变量
+ *   1. 显式 CLAUDE_TMUX_TARGET 环境变量（调用方最清楚会话在哪：claude-isolation 的 bridge 每次调 hook 都给）
+ *   2. tmux send-keys — 沿进程树找到 tty，再匹配 tmux pane
+ *   3. FIFO 中继    — pty-relay.py 运行时，通过 FIFO 管道传递
+ *   4. pty master 写入 — 扫描 /proc 找到 pty master fd 直接写入
+ *   5. TIOCSTI ioctl  — Linux 受限环境下的备用方案
+ *
+ * tmux 目标串两种形态（`tmux:` 前缀之后的部分）：
+ *   <target>                        本机 tmux server（默认 socket），target 即 send-keys -t 的写法
+ *   <target>@<container>:<tmpdir>   容器里的 tmux server：经 docker exec --user <uid:gid> <container>
+ *                                   env TMUX_TMPDIR=<tmpdir> tmux … 到达。bridge 给的是
+ *                                   `=<session>@workbench-app:/wb/run`（= 取精确匹配）。
+ * 会话名（mutagen 字符集：字母数字和 -）不含 @ 和 :，所以按首个 @ 切分不会歧义。
  *
  * 用法:
  *   const { resolveTarget, injectKeys, injectText } = require('./terminal-inject');
@@ -17,9 +24,42 @@
  */
 
 const fs = require('fs');
-const { execSync, spawn } = require('child_process');
+const { execSync, spawn, spawnSync } = require('child_process');
 const { createTerminalInjector } = require('../core/terminal-injector');
-const { createTerminalRouter } = require('../core/terminal-router');
+
+// ── tmux 目标解析 ───────────────────────────────────────────
+
+/** 目标串 → { target: 会话级目标（has-session 用）, pane: 窗格级目标（send-keys / capture-pane 用）,
+ *  argv: 到达该 tmux server 的命令前缀 }。裸 `=name` 只对会话命令有效——窗格命令要写成 `=name:`
+ *  （实测 tmux 3.3a：`send-keys -t =name` 报 can't find pane），所以这里替调用方补上。 */
+function parseTmuxTarget(spec) {
+    const at = spec.indexOf('@');
+    const target = at < 0 ? spec : spec.slice(0, at);
+    if (!target) throw new Error(`bad tmux target: ${spec}`);
+    const pane = /^=[^:.]+$/.test(target) ? `${target}:` : target;
+    if (at < 0) return { target, pane, argv: ['tmux'] };
+    const rest = spec.slice(at + 1);
+    const colon = rest.indexOf(':');
+    if (colon <= 0 || colon === rest.length - 1) throw new Error(`bad tmux target: ${spec}`);
+    return {
+        target, pane,
+        argv: ['docker', 'exec', '--user', `${process.getuid()}:${process.getgid()}`, rest.slice(0, colon),
+            'env', `TMUX_TMPDIR=${rest.slice(colon + 1)}`, 'tmux'],
+    };
+}
+
+/** 目标串 → 会话名（去 = 精确匹配前缀、去 :window.pane、去 @server）。用作按会话落盘的文件名 */
+function tmuxSessionName(spec) {
+    return parseTmuxTarget(spec).target.replace(/^=/, '').split(/[:.]/)[0];
+}
+
+/** 该 tmux server 上会话是否存活（同步；docker exec 一次 ~150ms） */
+function tmuxHasSession(spec) {
+    try {
+        const { target, argv } = parseTmuxTarget(spec);
+        return spawnSync(argv[0], [...argv.slice(1), 'has-session', '-t', target], { stdio: 'ignore', timeout: 10000 }).status === 0;
+    } catch { return false; }
+}
 
 // ── Shell 引用辅助 ──────────────────────────────────────────
 
@@ -254,10 +294,11 @@ function injectViaFifo(fifoPath, keys) {
 }
 
 /** spawn 一次 `tmux send-keys`：不经 shell、stdio:'ignore' 不建管道、不占 libuv 线程池，比 exec 轻。 */
-function tmuxSendKeys(target, args) {
+function tmuxSendKeys(spec, args) {
+    const { pane, argv } = parseTmuxTarget(spec);
     return new Promise((resolve, reject) => {
-        const p = spawn('tmux', ['send-keys', '-t', target, ...args], { stdio: 'ignore' });
-        const timer = setTimeout(() => { try { p.kill(); } catch {} reject(new Error('tmux send-keys timeout')); }, 5000);
+        const p = spawn(argv[0], [...argv.slice(1), 'send-keys', '-t', pane, ...args], { stdio: 'ignore' });
+        const timer = setTimeout(() => { try { p.kill(); } catch {} reject(new Error('tmux send-keys timeout')); }, 10000);
         p.once('error', err => { clearTimeout(timer); reject(err); });
         p.once('close', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(`tmux exit ${code}`)); });
     });
@@ -288,13 +329,13 @@ function planTmuxKeys(keys) {
 }
 
 /** 通过 tmux send-keys 注入。spawn 直接传 argv，无需 shell quote。 */
-async function injectViaTmux(target, keys) {
+async function injectViaTmux(spec, keys) {
     // 逐组发送、组间 55ms 间隔（分组缘由见 planTmuxKeys）；长文本+Enter 也因此分两组，不会整块涌入被当粘贴。
     const groups = planTmuxKeys(keys);
     try {
         for (let g = 0; g < groups.length; g++) {
             if (g > 0) await new Promise(r => setTimeout(r, 55));
-            await tmuxSendKeys(target, groups[g].keys);
+            await tmuxSendKeys(spec, groups[g].keys);
         }
         return true;
     } catch (err) {
@@ -356,6 +397,8 @@ module.exports = {
     injectKeys,
     injectText,
     planTmuxKeys,
+    parseTmuxTarget,
+    tmuxSessionName,
+    tmuxHasSession,
     createTerminalInjector,
-    createTerminalRouter,
 };

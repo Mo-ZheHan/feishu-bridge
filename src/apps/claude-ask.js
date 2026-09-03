@@ -7,79 +7,22 @@
  * 单题/多题、单选/多选统一走 buildQuestionsForm；listener 收 form_value 后回放注入 TUI。
  */
 
-const fs = require('fs');
-const Lark = require('@larksuiteoapi/node-sdk');
 require('../lib/env-config');
 const { sessionState } = require('../lib/session-state');
 const { resolvePtsDevice } = require('../lib/terminal-inject');
 const { buildQuestionsForm, buildSingleSelectCard } = require('../lib/feishu-card-utils');
+const { findTail } = require('../lib/transcript-utils');
+const { getFeishuAppClient, sendCard: sendFeishuCard } = require('../lib/feishu-app');
+const { readStdinJson } = require('../lib/stdin-json');
 
-// ── Utility functions ─────────────────────────────────────
-
-function readStdin() {
-    return new Promise((resolve) => {
-        let data = '';
-        let resolved = false;
-        const done = (val) => { if (!resolved) { resolved = true; resolve(val); } };
-        process.stdin.setEncoding('utf8');
-        process.stdin.on('data', chunk => data += chunk);
-        process.stdin.on('end', () => { try { done(JSON.parse(data)); } catch { done({}); } });
-        setTimeout(() => done({}), 3000).unref();
-    });
-}
-
-/**
- * Extract contextText from the last assistant message in the transcript.
- * Looks for text blocks preceding the AskUserQuestion tool_use block.
- */
+/** 最后一条 assistant 消息里、AskUserQuestion 之前的文本块（作卡片上下文）；最后一条不含问卷则 '' */
 function extractContextText(transcriptPath) {
-    if (!transcriptPath) return '';
-    try {
-        const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
-        for (let i = lines.length - 1; i >= 0; i--) {
-            let d;
-            try { d = JSON.parse(lines[i]); } catch { continue; }
-            if (d.type !== 'assistant') continue;
-            const content = d.message?.content || [];
-            let contextText = '';
-            let hasAskUserQuestion = false;
-            for (const block of content) {
-                if (block.type === 'text' && block.text) {
-                    contextText += block.text + '\n';
-                }
-                if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
-                    hasAskUserQuestion = true;
-                }
-            }
-            if (hasAskUserQuestion) {
-                return contextText.trim();
-            }
-            return '';
-        }
-    } catch {}
-    return '';
-}
-
-// ── Feishu client ─────────────────────────────────────────
-
-async function getFeishuAppClient() {
-    const appId = process.env.FEISHU_APP_ID;
-    const appSecret = process.env.FEISHU_APP_SECRET;
-    if (!appId || !appSecret) return null;
-
-    const client = new Lark.Client({ appId, appSecret });
-
-    let chatId = process.env.FEISHU_CHAT_ID;
-    if (!chatId) {
-        try {
-            const resp = await client.im.chat.list({ params: { page_size: 5 } });
-            const chats = resp?.data?.items || [];
-            if (chats.length === 0) return null;
-            chatId = chats[0].chat_id;
-        } catch { return null; }
-    }
-
-    return { client, chatId };
+    return findTail(transcriptPath, (d) => {
+        if (d.type !== 'assistant') return undefined;
+        const content = d.message?.content || [];
+        if (!content.some(b => b.type === 'tool_use' && b.name === 'AskUserQuestion')) return '';
+        return content.filter(b => b.type === 'text' && b.text).map(b => b.text).join('\n').trim();
+    }) || '';
 }
 
 // ── Card senders ──────────────────────────────────────────
@@ -98,10 +41,7 @@ async function sendCard(app, card, stateKey, ptsDevice, sessionId, notificationT
         ...meta,
     });
     try {
-        await app.client.im.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: { receive_id: app.chatId, msg_type: 'interactive', content: JSON.stringify(card) },
-        });
+        await sendFeishuCard(app, card);
     } catch (err) {
         console.error('[ask-handler] 发送卡片失败:', err.message);
     }
@@ -122,32 +62,25 @@ function sendQuestionsForm(app, questions, stateKey, ptsDevice, sessionId, notif
 // ── Main ─────────────────────────────────────────────────
 
 async function main() {
-    const data = await readStdin();
+    const data = await readStdinJson();
 
     // Guard: only handle PreToolUse / AskUserQuestion
     if (data.hook_event_name !== 'PreToolUse') return;
     if (data.tool_name !== 'AskUserQuestion') return;
 
-    // Guard: need Feishu app credentials
-    if (!process.env.FEISHU_APP_ID || !process.env.FEISHU_APP_SECRET) return;
+    const questions = data.tool_input?.questions;
+    if (!Array.isArray(questions) || questions.length === 0) return;
 
     const app = await getFeishuAppClient();
     if (!app) return;
 
-    const questions = data.tool_input?.questions;
-    if (!Array.isArray(questions) || questions.length === 0) return;
-
     const sessionId = data.session_id || '';
-    const transcriptPath = data.transcript_path || '';
-
     const stateKey = `feishu_ask_${sessionId.substring(0, 8)}_${Date.now()}`;
     const ptsDevice = resolvePtsDevice(process.ppid);
     const notificationType = 'AskUserQuestion';
 
-    // Extract context text from transcript (text blocks before the AskUserQuestion tool_use)
-    const contextText = extractContextText(transcriptPath);
-
-    // Attach contextText to question objects for use in card builders
+    // Attach contextText (text blocks before the AskUserQuestion tool_use) for the card builders
+    const contextText = extractContextText(data.transcript_path);
     questions.forEach(q => { q._contextText = contextText; });
 
     // 单题单选(非预览) → 按钮卡（一点即答）；多题/多选/预览题 → form 卡（预览题要选项+备注一起收）。回放都走 buildReplayPlan
@@ -166,5 +99,6 @@ module.exports = {
     getFeishuAppClient,
     sendSingleSelectCard,
     sendQuestionsForm,
+    extractContextText,
     main,
 };

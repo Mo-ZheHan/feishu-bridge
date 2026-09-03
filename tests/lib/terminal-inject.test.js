@@ -53,3 +53,25 @@ test('未知/不完整 CSI 安全回退成 Escape + 字面（不越界、不误�
   assert.deepEqual(planTmuxKeys('\x1b[H'), [{ named: true, keys: ['Escape'] }, { named: false, keys: ['[', 'H'] }]);
   assert.deepEqual(planTmuxKeys('\x1b['), [{ named: true, keys: ['Escape'] }, { named: false, keys: ['['] }]);
 });
+
+// ── 目标串解析：本机 tmux 与容器 tmux（经 docker exec） ──
+const { parseTmuxTarget, tmuxSessionName } = require('../../src/lib/terminal-inject');
+
+test('parseTmuxTarget：无 @ 即本机 tmux；带 @container:tmpdir 走 docker exec --user uid:gid；裸 =name 的窗格目标补冒号', () => {
+  assert.deepEqual(parseTmuxTarget('claude-x:0.0'), { target: 'claude-x:0.0', pane: 'claude-x:0.0', argv: ['tmux'] });
+  const r = parseTmuxTarget('=claude-chat@workbench-app:/wb/run');
+  assert.equal(r.target, '=claude-chat');
+  assert.equal(r.pane, '=claude-chat:'); // tmux 3.3a：send-keys -t =name 找不到窗格，=name: 才行
+  assert.deepEqual(r.argv, ['docker', 'exec', '--user', `${process.getuid()}:${process.getgid()}`, 'workbench-app', 'env', 'TMUX_TMPDIR=/wb/run', 'tmux']);
+  assert.equal(parseTmuxTarget('=s:1.1@c:/run').pane, '=s:1.1');
+  assert.throws(() => parseTmuxTarget('x@'), /bad tmux target/);
+  assert.throws(() => parseTmuxTarget('x@c'), /bad tmux target/);
+  assert.throws(() => parseTmuxTarget('x@c:'), /bad tmux target/);
+  assert.throws(() => parseTmuxTarget('@c:/run'), /bad tmux target/);
+});
+
+test('tmuxSessionName：去 =、去 :window.pane、去 @server，用作按会话落盘的文件名', () => {
+  assert.equal(tmuxSessionName('=claude-chat@workbench-app:/wb/run'), 'claude-chat');
+  assert.equal(tmuxSessionName('claude-x-120000:0.0'), 'claude-x-120000');
+  assert.equal(tmuxSessionName('claude-x'), 'claude-x');
+});

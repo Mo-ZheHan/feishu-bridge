@@ -39,6 +39,11 @@
 
 - Claude 的实时摘要基于 hook 事件与 transcript
 - `FEISHU_LIVE_CAPTURE` 语义来源于 Claude 的实现，是全项目的基准语义
+- Claude 只在 claude-isolation 的隔离容器里跑。飞书端 `ccc` / `ccc <host>` 起会话时，
+  `src/apps/launcher.js` 调 `host/launch_session.sh --detached`（本地）或 `ccc <host> <proj> --detached`
+  （远程，ccc 负责 rsync 播种）在容器里建 detached tmux 会话；绝不在宿主机起 Claude
+- 终端注入目标形如 `<session>@workbench-app:/wb/run`（容器 tmux，经 docker exec），由 bridge 经
+  `CLAUDE_TMUX_TARGET` 下发；`ccc back` 的会话表来自 hook 落盘的 `/tmp/claude-tmux-<session>.json`
 
 ### Codex
 
@@ -85,47 +90,46 @@ Codex 的实时摘要规则：
 
 ## 7. 测试与验证
 
-运行全量测试（推荐 bun，Node 16 不支持 `--test`）：
+运行全量测试（Node ≥ 22，`--test` 自带 glob 展开；引号不能省，否则 sh 把 `**` 当 `*`，三层目录下的用例静默跳过）：
 
 ```bash
-bun test tests/
+npm test          # node --test "tests/**/*.test.js"
 ```
 
 ### 测试目录结构
 
 ```
 tests/
-├── adapters/
-│   ├── claude/
-│   │   ├── fixture-ask.test.js        # Claude ask-handler 适配器固件
-│   │   ├── fixture-hook.test.js       # Claude hook-handler 适配器固件
-│   │   └── fixture-live.test.js       # Claude live-handler 适配器固件
-│   └── codex/
-│       ├── cli-input-bridge.test.js   # Codex 输入桥接：文本/审批/单选/多选注入
-│       └── cli-output-parser.test.js  # Codex 终端输出解析
+├── adapters/codex/
+│   ├── cli-input-bridge.test.js       # Codex 输入桥接：文本/审批/单选/多选注入
+│   └── cli-output-parser.test.js      # Codex 终端输出解析
 ├── apps/
-│   ├── claude-ask.test.js             # Claude AskUserQuestion 按钮映射 (↓+CR)
+│   ├── claude-ask.test.js             # Claude AskUserQuestion form 卡与回放元数据
+│   ├── claude-hook.test.js            # Claude Stop/StopFailure 卡、问卷检测、会话登记
+│   ├── claude-live.test.js            # Claude 执行摘要卡与 turn 重建
+│   ├── launcher.test.js               # 飞书起 ccc 会话：命令解析、主机表、会话名
 │   ├── codex-live.test.js             # Codex 实时摘要卡片
 │   ├── codex-session-watcher.test.js  # Codex session 文件监控
-│   ├── codex-watcher.test.js          # Codex PTY 输出监控与交互卡
-│   └── feishu-listener.test.js               # 飞书监听器与交互回流
+│   └── codex-watcher.test.js          # Codex PTY 输出监控与交互卡
 ├── channels/
 │   ├── codex-feishu-interaction-scenarios.test.js  # Codex 飞书交互端到端场景
-│   └── feishu-interaction-handler.test.js          # 飞书交互处理器单元测试
-├── core/
-│   ├── card-state-store.test.js       # 卡片状态存储
-│   └── session-store.test.js          # 会话存储
+│   ├── feishu-interaction-handler.test.js          # 飞书交互处理器单元测试
+│   └── resolve-chat-id.test.js                     # 群 id 解析
 └── lib/
-    └── session-state.test.js          # session-state 模块测试
+    ├── askq-replay.test.js            # 问卷回放键序规划
+    ├── card.test.js                   # 终端 id 显示（本机/容器目标）
+    ├── session-state.test.js          # 状态文件：__meta__ 合并、封顶
+    ├── terminal-inject.test.js        # tmux 键分组、目标串解析
+    ├── transcript-utils.test.js       # 窗口式倒序读 transcript
+    └── …                              # 卡片构建的其余用例
 ```
 
 ### 专项测试
 
-- Codex 解析/桥接：`bun test tests/adapters/codex/`
-- Codex 应用层：`bun test tests/apps/codex-*.test.js`
-- Claude 按钮映射：`bun test tests/apps/claude-ask.test.js`
-- 飞书交互链路：`bun test tests/channels/`
-- Python 语法检查：`python3 -m py_compile pty-relay.py`
+- Codex 解析/桥接：`node --test "tests/adapters/codex/*.test.js"`
+- Claude 链路：`node --test "tests/apps/claude-*.test.js" "tests/lib/*.test.js"`
+- 飞书交互链路：`node --test "tests/channels/*.test.js"`
+- Python 语法检查：`python3 -m py_compile bin/pty-relay.py`
 
 ### 原则
 
@@ -133,6 +137,7 @@ tests/
 - 改交互桥时，要覆盖文本、审批、单选、多选
 - 改飞书卡片时，除了单测，还应做真机弹窗验证
 - 终端注入使用 `\r`(CR) 作为 Enter，不用 `\n`(LF) — PTY raw mode 下 LF 不是 Enter
+- 读 transcript 只用 `lib/transcript-utils` 的尾部窗口读，不要 `readFileSync` 整文件——它会长到几百 MB
 
 ## 8. 运行与联调
 

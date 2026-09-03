@@ -2,8 +2,11 @@
 
 const fs = require('fs');
 const path = require('path');
-const { createSessionStore } = require('../core/session-store');
-const { createCardStateStore } = require('../core/card-state-store');
+
+// 交互条目总量上限：超过就按 created_at 删最旧的（纯计数、不看年龄）。所有卡类型 + live_msg + __stop_sent
+// 共用这个预算。放宽到 1000 是为了配合 72h 的时间窗口——否则一天约 150 条的量下，计数上限会先于时间过期
+// 把还想回复的旧卡顶掉，成了"看不见的真过期"。
+const MAX_ENTRIES = 1000;
 
 class SessionState {
     constructor(statePath) {
@@ -49,18 +52,18 @@ class SessionState {
      *
      * Optimizations:
      * - Cleans stale Stop/StopFailure entries from the same terminal
-     * - Caps total entries at MAX_ENTRIES (default 200)
+     * - Caps total entries at MAX_ENTRIES (default 1000)
      */
     addNotification(messageId, entry) {
         this.load();
 
         this.data[messageId] = entry;
 
-        // 上限保护：超过 200 条时删除最旧的
+        // 上限保护：超过 MAX_ENTRIES 条时删除最旧的
         const keys = Object.keys(this.data).filter((key) => key !== '__meta__');
-        if (keys.length > 200) {
+        if (keys.length > MAX_ENTRIES) {
             const sorted = keys.sort((a, b) => (this.data[a].created_at || 0) - (this.data[b].created_at || 0));
-            const removeCount = keys.length - 200;
+            const removeCount = keys.length - MAX_ENTRIES;
             for (let i = 0; i < removeCount; i++) {
                 delete this.data[sorted[i]];
             }
@@ -93,7 +96,8 @@ class SessionState {
     setLastInteractedDevice(ptsDevice) {
         if (!ptsDevice) return;
         this.load();
-        this.data['__meta__'] = { lastInteractedDevice: ptsDevice, updated_at: Date.now() };
+        // 合并而非整体覆盖：__meta__ 还存着「全局允许」的终端表，整体覆盖会把它抹掉
+        this.data['__meta__'] = { ...(this.data['__meta__'] || {}), lastInteractedDevice: ptsDevice, updated_at: Date.now() };
         this.save();
     }
 
@@ -149,11 +153,11 @@ class SessionState {
 
     /**
      * Removes entries older than maxAgeMs.
-     * Default 12 hours, configurable via NOTIFICATION_EXPIRE_HOURS env var.
+     * Default 72 hours, configurable via NOTIFICATION_EXPIRE_HOURS env var.
      */
     cleanExpired(maxAgeMs) {
         if (!maxAgeMs) {
-            const hours = parseFloat(process.env.NOTIFICATION_EXPIRE_HOURS) || 12;
+            const hours = parseFloat(process.env.NOTIFICATION_EXPIRE_HOURS) || 72;
             maxAgeMs = hours * 3600000;
         }
         this.load();
@@ -176,14 +180,7 @@ class SessionState {
     }
 }
 
-const sessionStore = createSessionStore();
-const cardStateStore = createCardStateStore();
-
 module.exports = {
     SessionState,
     sessionState: new SessionState(),
-    createSessionStore,
-    createCardStateStore,
-    sessionStore,
-    cardStateStore,
 };
